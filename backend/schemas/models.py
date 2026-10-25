@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from enum import Enum
 from pydantic import BaseModel, Field
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from backend.schemas.provenance import (
     InputProvenance, ExecutionMode, RegistrationQuality, SecondaryEvidenceStatus
 )
@@ -93,14 +93,17 @@ class ImageMetadata(BaseModel):
     sensor: str = "Unknown"
     acquisition_date: str = "Unknown"
     image_type: str = "Optical"   # "Optical", "SAR", "Multispectral"
-    resolution_m: float = 10.0
+    resolution_m: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     width_px: int = 0
     height_px: int = 0
-    cloud_coverage_pct: float = 0.0
+    cloud_coverage_pct: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     cloud_status: str = "Unknown"  # "Clear", "Detected", "Reconstructed"
     processing_status: str = "Ready"
     coordinates: Optional[str] = None
     base64_thumbnail: Optional[str] = None
+    source: str = "unknown"
+    provenance: InputProvenance = InputProvenance.UNKNOWN
+    pixel_sha256: str = ""
 
 
 # ─── Analysis Session ─────────────────────────────────────────────────────────
@@ -142,7 +145,10 @@ class AnalysisSession(BaseModel):
     visual_outputs: List[Dict[str, str]] = Field(default_factory=list)
     status: str = "pending"  # "pending", "running", "completed", "error"
     error_message: str = ""
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    events: List[Dict[str, Any]] = Field(default_factory=list)
+    completion: Dict[str, Any] = Field(default_factory=dict)
+    audit_manifest: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: Optional[str] = None
     is_demo: bool = False
 

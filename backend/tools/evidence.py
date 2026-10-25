@@ -1,62 +1,17 @@
-"""
-SatQuery AI — Evidence Strength Calculator
+"""Heuristic evidence, not calibrated probability.
 
-Computes an explainable Evidence Strength Score (0–1) from the results
-of the specialist-tool pipeline.
-
-This is NOT probabilistic confidence. It is a structured score built
-from verifiable factors, with each factor documented.
-
-Formula (documented):
-  evidence_strength =
-      0.25 * data_quality_score
-    + 0.30 * algorithm_confidence
-    + 0.25 * registration_quality_score
-    + 0.20 * cross_method_agreement
-
-Factor definitions:
-  data_quality_score:
-    - Start at 1.0
-    - Deduct 0.3 if any input has SYNTHETIC_DATA provenance
-    - Deduct 0.2 if any input is UNKNOWN provenance
-    - Deduct 0.3 if cloud_percentage >= 20 (cloud contamination)
-    - Deduct 0.2 if any tool has is_demo=True
-    - Clamp to [0, 1]
-
-  algorithm_confidence:
-    - Mean of tool confidence scores WHERE execution_mode == LIVE_ALGORITHM
-    - If no LIVE_ALGORITHM tools: 0.0 (all simulated)
-
-  registration_quality_score:
-    - SUCCESS  → 1.0
-    - PARTIAL  → 0.5
-    - FAILED   → 0.0  (change result was blocked)
-    - NOT_ATTEMPTED / NOT_REQUIRED → excluded from formula (weight redistributed)
-
-  cross_method_agreement:
-    - All tools agree (no conflict) → 1.0
-    - One conflict → 0.5
-    - Multiple conflicts → 0.0
-    - Only one LIVE_ALGORITHM tool → 0.5 (single-method, no cross-check possible)
-
-Secondary evidence:
-  The evidence strength does NOT trigger a secondary analysis unless
-  a genuinely independent second source exists.
-  If evidence_strength < LOW_EVIDENCE_THRESHOLD:
-    → emit LOW_EVIDENCE event
-    → check for real independent secondary method
-    → if none: return NO_SECONDARY_EVIDENCE_AVAILABLE
-    → NEVER manufacture a secondary analysis to trigger the demo
-
-Interpretation labels:
-  0.80–1.00: High evidence — result is likely reliable
-  0.60–0.79: Moderate evidence — minor caveats
-  0.40–0.59: Low evidence — results should be treated with caution
-  0.00–0.39: Very low evidence — result is not suitable for reporting
+Nominal weights: quality .25, algorithm .30, registration screening .25,
+independent agreement .20. Registration weight is equally redistributed if
+not applicable. No current tool implements an independent agreement check.
+Demo/synthetic, missing provenance, failed/excluded and bookkeeping outputs
+cannot supply algorithm evidence. No eligible support forces total score zero.
+Runtime low-evidence threshold remains .55; research threshold .60 is separate.
 """
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import hashlib
+import json
 
 from backend.schemas.provenance import (
     ExecutionMode, InputProvenance, RegistrationQuality, SecondaryEvidenceStatus
@@ -72,6 +27,19 @@ WEIGHTS = {
     "cross_method_agreement": 0.20,
 }
 LOW_EVIDENCE_THRESHOLD = 0.55
+RESEARCH_THRESHOLD = 0.60  # reporting protocol only; not a runtime decision threshold
+HIGH_EVIDENCE_THRESHOLD = 0.75
+
+META_TOOLS = {"image_validation", "cloud_reconstruction", "confidence_check", "evidence_comparison", "answer_synthesis"}
+
+def eligible(r):
+    return (r.get("tool_name") not in META_TOOLS
+            and r.get("execution_mode") == ExecutionMode.LIVE_ALGORITHM
+            and not r.get("evidence_excludable", False)
+            and not r.get("is_demo", True)
+            and r.get("status", "success") in ("success", "warning")
+            and r.get("input_provenance") in (InputProvenance.USER_UPLOAD, InputProvenance.REAL_SATELLITE_DATA, InputProvenance.BENCHMARK_DATA)
+            and r.get("registration_quality") not in (RegistrationQuality.FAILED, RegistrationQuality.PARTIAL))
 
 
 # ── Result data class ─────────────────────────────────────────────────────────
@@ -86,13 +54,14 @@ class EvidenceStrengthResult:
     secondary_evidence_status: Optional[SecondaryEvidenceStatus]
     secondary_evidence_reason: Optional[str]
     interpretation: str
+    audit_hash: str
     warnings: list = field(default_factory=list)
 
 
 def _interpret(score: float) -> str:
-    if score >= 0.80:
-        return "High evidence — result is likely reliable."
-    elif score >= 0.60:
+    if score >= HIGH_EVIDENCE_THRESHOLD:
+        return "High heuristic evidence; not calibrated probability or independent verification."
+    elif score >= LOW_EVIDENCE_THRESHOLD:
         return "Moderate evidence — minor caveats apply."
     elif score >= 0.40:
         return "Low evidence — results should be treated with caution."
@@ -101,9 +70,9 @@ def _interpret(score: float) -> str:
 
 
 def _confidence_level(score: float) -> str:
-    if score >= 0.75:
+    if score >= HIGH_EVIDENCE_THRESHOLD:
         return "high"
-    elif score >= 0.55:
+    elif score >= LOW_EVIDENCE_THRESHOLD:
         return "moderate"
     elif score >= 0.35:
         return "low"
@@ -119,14 +88,14 @@ def _data_quality_factor(tool_results: List[Dict]) -> Dict:
     # Check provenance across all results
     provenances = [r.get("input_provenance") for r in tool_results if r.get("input_provenance")]
     has_synthetic = any(p == InputProvenance.SYNTHETIC_DATA for p in provenances)
-    has_unknown   = any(p == InputProvenance.UNKNOWN for p in provenances)
+    has_unknown = not tool_results or any(not r.get("input_provenance") or r.get("input_provenance") == InputProvenance.UNKNOWN for r in tool_results)
 
     if has_synthetic:
         score -= 0.30
-        reasons.append("Synthetic input data (-0.30)")
+        reasons.append("Synthetic input (-0.30)")
     if has_unknown:
         score -= 0.20
-        reasons.append("Unknown input provenance (-0.20)")
+        reasons.append("Missing or unknown input provenance (-0.20)")
 
     # Check cloud contamination
     for r in tool_results:
@@ -141,11 +110,11 @@ def _data_quality_factor(tool_results: List[Dict]) -> Dict:
     any_demo = any(r.get("is_demo", True) for r in tool_results)
     if any_demo:
         score -= 0.20
-        reasons.append("Some tools ran in demo/simulated mode (-0.20)")
+        reasons.append("Demonstration input/output (-0.20)")
 
     score = max(0.0, min(1.0, score))
     if not reasons:
-        reasons.append("All inputs have verified provenance, no cloud contamination, live algorithms.")
+        reasons.append("Recorded source provenance; no detected quality penalty. Source authenticity is not verified.")
 
     return {
         "score": round(score, 3),
@@ -158,8 +127,7 @@ def _algorithm_confidence_factor(tool_results: List[Dict]) -> Dict:
     live_confs = [
         r.get("confidence", 0.0)
         for r in tool_results
-        if r.get("execution_mode") == ExecutionMode.LIVE_ALGORITHM
-        and not r.get("evidence_excludable", False)
+        if eligible(r)
         and r.get("confidence") is not None
     ]
 
@@ -174,8 +142,8 @@ def _algorithm_confidence_factor(tool_results: List[Dict]) -> Dict:
     return {
         "score": score,
         "reason": (
-            f"Mean confidence across {len(live_confs)} LIVE_ALGORITHM tool(s): {score:.3f}. "
-            f"Excludes simulated and excluded results."
+            f"Mean confidence across tool(s): {score:.3f}. "
+            f"Excludes low-quality and excluded results."
         ),
         "weight": WEIGHTS["algorithm_confidence"],
     }
@@ -186,13 +154,17 @@ def _registration_factor(tool_results: List[Dict]) -> Optional[Dict]:
     Returns None if no registration result exists (weight redistributed).
     """
     for r in tool_results:
+        if (r.get("execution_mode") != ExecutionMode.LIVE_ALGORITHM
+                or r.get("is_demo", True) or r.get("evidence_excludable", False)
+                or r.get("input_provenance") not in (InputProvenance.USER_UPLOAD, InputProvenance.REAL_SATELLITE_DATA, InputProvenance.BENCHMARK_DATA)):
+            continue
         reg_quality = r.get("registration_quality")
         if reg_quality is None:
             continue
         if reg_quality == RegistrationQuality.SUCCESS:
             return {
                 "score": 1.0,
-                "reason": "ECC registration succeeded within strict error threshold.",
+                "reason": "ECC converged within the photometric residual screening threshold; geometric accuracy is unverified.",
                 "weight": WEIGHTS["registration_quality"],
             }
         elif reg_quality == RegistrationQuality.PARTIAL:
@@ -218,33 +190,10 @@ def _registration_factor(tool_results: List[Dict]) -> Optional[Dict]:
 
 
 def _cross_method_agreement_factor(tool_results: List[Dict]) -> Dict:
-    conflicts = sum(
-        1 for r in tool_results
-        if r.get("result", {}).get("agreement") is False
-    )
-    live_count = sum(
-        1 for r in tool_results
-        if r.get("execution_mode") == ExecutionMode.LIVE_ALGORITHM
-    )
-
-    if conflicts >= 2:
-        score = 0.0
-        reason = f"Multiple conflicts ({conflicts}) detected between tools."
-    elif conflicts == 1:
-        score = 0.5
-        reason = "One conflict detected between tools."
-    elif live_count <= 1:
-        score = 0.5
-        reason = "Only one LIVE_ALGORITHM tool — no cross-method check possible."
-    else:
-        score = 1.0
-        reason = f"All {live_count} LIVE_ALGORITHM tools agree — no conflicts."
-
-    return {
-        "score": round(score, 3),
-        "reason": reason,
-        "weight": WEIGHTS["cross_method_agreement"],
-    }
+    # Absence of a conflict is not an independent comparison. No current
+    # pipeline tool implements a validated, independent agreement test.
+    return {"score": 0.0, "reason": "No independent same-claim comparison was executed.",
+            "weight": WEIGHTS["cross_method_agreement"]}
 
 
 # ── Main function ─────────────────────────────────────────────────────────────
@@ -267,6 +216,7 @@ def compute_evidence_strength(
     Returns:
         EvidenceStrengthResult with full breakdown and provenance metadata.
     """
+    tool_results = [r for r in tool_results if r.get("tool_name") not in META_TOOLS]
     # ── Compute factors ───────────────────────────────────────────────────────
     data_q    = _data_quality_factor(tool_results)
     algo_conf = _algorithm_confidence_factor(tool_results)
@@ -297,6 +247,14 @@ def compute_evidence_strength(
     )
     evidence_strength = max(0.0, min(1.0, evidence_strength))
 
+    if not any(eligible(r) for r in tool_results):
+        evidence_strength = 0.0
+    data_q["weight"] = w_data
+    algo_conf["weight"] = w_algo
+    agree_q["weight"] = w_agree
+    if reg_q is not None and reg_q["score"] is None:
+        reg_q["weight"] = 0.0
+
     # ── Low evidence check ────────────────────────────────────────────────────
     low_evidence = evidence_strength < LOW_EVIDENCE_THRESHOLD
 
@@ -324,14 +282,14 @@ def compute_evidence_strength(
     if reg_q is not None:
         breakdown["registration_quality"] = reg_q
 
-    formula = (
-        f"evidence_strength = "
-        f"{w_data:.2f} × data_quality({data_q['score']:.3f})"
-        f" + {w_algo:.2f} × algo_confidence({algo_conf['score']:.3f})"
-        f" + {WEIGHTS['registration_quality']:.2f} × registration({reg_q['score'] if reg_q else 'N/A'})"
-        f" + {w_agree:.2f} × agreement({agree_q['score']:.3f})"
-        f" = {evidence_strength:.3f}"
-    )
+    formula = "evidence_strength = " + " + ".join(
+        f"{v['weight']:.6f} * {k}({v['score']})" for k, v in breakdown.items()
+        if v['score'] is not None
+    ) + f" = {evidence_strength:.3f} (zero when no eligible supporting computation)"
+
+    # ── Generate Audit Hash ───────────────────────────────────────────────────
+    hash_payload = {"results": tool_results, "breakdown": breakdown, "strength": evidence_strength}
+    audit_hash = hashlib.sha256(json.dumps(hash_payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     return EvidenceStrengthResult(
         evidence_strength=evidence_strength,
@@ -342,4 +300,5 @@ def compute_evidence_strength(
         secondary_evidence_status=sec_status,
         secondary_evidence_reason=sec_reason,
         interpretation=_interpret(evidence_strength),
+        audit_hash=audit_hash,
     )

@@ -46,7 +46,6 @@ class BaseTool(ABC):
         start = time.time()
         result = self.run(inputs)
         result.execution_time_ms = int((time.time() - start) * 1000)
-        result.is_demo = self.is_demo
         return result
 
     def _success(

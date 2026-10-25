@@ -157,12 +157,12 @@ class CloudDetectionTool(BaseTool):
     def run(self, inputs: Dict[str, Any]) -> ToolResult:
         context = inputs.get("context", {})
         demo_scenario = context.get("demo_scenario", "demo1")
-        
+
         loaded_scenes = inputs.get("loaded_scenes", [])
         if loaded_scenes:
             prov = getattr(loaded_scenes[0], "input_provenance", InputProvenance.UNKNOWN)
             return self._run_real(loaded_scenes[0].image_b64, provenance=prov)
-            
+
         image_b64 = _extract_scene_b64(inputs, 0)
         if image_b64:
             return self._run_real(image_b64)
@@ -259,7 +259,7 @@ class CloudReconstructionTool(BaseTool):
         image_b64  = _extract_scene_b64(inputs, 0)
         mask_b64   = context.get("cloud_mask_b64")
         scene_id   = context.get("scene_id")
-        input_prov = InputProvenance.USER_UPLOAD if image_b64 else InputProvenance.SYNTHETIC_DATA
+        input_prov = context.get("input_provenance", InputProvenance.UNKNOWN)
 
         if image_b64 and mask_b64:
             return self._run_real(image_b64, mask_b64, scene_id, input_prov)
@@ -270,8 +270,8 @@ class CloudReconstructionTool(BaseTool):
             return self._run_demo()
 
     def _run_real(self, image_b64: str, mask_b64: str, scene_id: Optional[str], prov: InputProvenance) -> ToolResult:
-        from backend.providers.provider_factory import get_reconstruction_provider
-        provider = get_reconstruction_provider(scene_id)
+        from backend.providers.cpu_provider import CPUInpaintingProvider
+        provider = CPUInpaintingProvider()
         pr = provider.reconstruct(image_b64, mask_b64, scene_id, prov)
 
         result = {
@@ -297,6 +297,7 @@ class CloudReconstructionTool(BaseTool):
         tr.execution_mode = pr.execution_mode
         tr.input_provenance = prov
         tr.algorithm = pr.algorithm
+        tr.metadata.update(pr.metadata)
         tr.warnings = pr.warnings
         return tr
 
@@ -395,6 +396,34 @@ class ObjectRegionDetectionTool(BaseTool):
             {"label": "Water body",        "confidence": 0.90, "bbox": [0, 390, 155, 512]},
             {"label": "River",             "confidence": 0.92, "bbox": [178, 0, 210, 512]},
         ]
+
+        # Try to get an image to draw on
+        image_b64 = _extract_scene_b64(inputs, 0)
+        visual_out = None
+
+        if not image_b64:
+            image_b64 = demo_imagery.generate_urban_scene("2024", expansion_factor=0.0)
+
+        if image_b64:
+            try:
+                from PIL import ImageDraw, ImageFont
+                raw = base64.b64decode(image_b64)
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                draw = ImageDraw.Draw(img)
+                for det in detections:
+                    box = det["bbox"] # [xmin, ymin, xmax, ymax]
+                    # Draw red box
+                    draw.rectangle(box, outline="red", width=3)
+                    # Optional text label background
+                    draw.rectangle([box[0], box[1]-15, box[0]+80, box[1]], fill="red")
+                    draw.text((box[0]+2, box[1]-13), f"{det['label']} {det['confidence']:.2f}", fill="white")
+
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                visual_out = base64.b64encode(buf.getvalue()).decode("utf-8")
+            except Exception as e:
+                print(f"Failed to draw bboxes: {e}")
+
         tr = self._success(
             confidence=0.72,
             result={
@@ -404,6 +433,8 @@ class ObjectRegionDetectionTool(BaseTool):
                 "note": "[SIMULATED] Bounding boxes are illustrative. Requires real object detection model.",
             },
             message=f"Detected {len(detections)} regions. [SIMULATED]",
+            visual_output=visual_out,
+            visual_type="bounding_boxes",
         )
         tr.is_demo = True
         tr.execution_mode = ExecutionMode.SIMULATED
@@ -484,13 +515,14 @@ class BiTemporalChangeDetectionTool(BaseTool):
                         "unreliable_registration": True,
                         "registration_quality": cdr.registration_quality.value,
                         "registration_method": cdr.registration_method,
+                        "registration_intensity_residual": cdr.registration_intensity_residual,
                         "changed_area_pct": None,
                         "message": cdr.message,
                     },
                     message="UNRELIABLE_REGISTRATION: Change % not computed.",
                     is_demo=False,
                     execution_mode=ExecutionMode.LIVE_ALGORITHM,
-                    input_provenance=InputProvenance.USER_UPLOAD,
+                    input_provenance=provenance,
                     algorithm=cdr.algorithm,
                     registration_quality=cdr.registration_quality,
                     evidence_excludable=True,
@@ -506,7 +538,7 @@ class BiTemporalChangeDetectionTool(BaseTool):
                 "unreliable_registration": cdr.unreliable_registration,
                 "registration_quality": cdr.registration_quality.value,
                 "registration_method": cdr.registration_method,
-                "registration_error_px": cdr.registration_error_px,
+                "registration_intensity_residual": cdr.registration_intensity_residual,
                 "otsu_threshold": cdr.otsu_threshold,
                 "processed_dimensions": list(cdr.processed_shape),
                 "t2_resized": cdr.t2_was_resized,
@@ -719,72 +751,16 @@ class AnswerSynthesisTool(BaseTool):
     description = "Synthesises tool results into a final answer grounded in actual evidence."
     is_demo = True
 
-    ANSWERS = {
-        "demo1": (
-            "Based on bi-temporal analysis of the Sentinel-2 imagery (2024–2026), "
-            "built-up land cover increased by approximately 9.2 percentage points within "
-            "the selected region. The largest detected changes are concentrated on the "
-            "eastern bank of the river, within a 300-metre buffer zone. Vegetation cover "
-            "correspondingly decreased by 6.7 percentage points."
-        ),
-        "demo2": (
-            "Cross-modal analysis identifies built-up regions covering approximately 42% of the scene. "
-            "Note: SAR imagery was not available for this session — SAR fusion was not performed. "
-            "Classification is based on optical imagery only."
-        ),
-        "demo3": (
-            "The input optical image contained significant cloud contamination (38% coverage). "
-            "The agent automatically triggered cloud reconstruction before proceeding. "
-            "Post-reconstruction analysis identifies built-up expansion of approximately 11% "
-            "between the two dates. Results in areas of high cloud coverage should be interpreted with caution."
-        ),
-    }
-
     def run(self, inputs: Dict[str, Any]) -> ToolResult:
+        from backend.services.grounded_answer import synthesize
         context = inputs.get("context", {})
-        demo_scenario = context.get("demo_scenario", "demo1")
-        tool_results = context.get("tool_results", [])
-
-        # Prefer real change detection result if available
-        real_change = None
-        for r in tool_results:
-            if (r.get("tool_name") == "bi_temporal_change_detection"
-                    and not r.get("evidence_excludable")
-                    and r.get("result", {}).get("changed_area_pct") is not None):
-                real_change = r["result"]["changed_area_pct"]
-                break
-
-        if real_change is not None:
-            answer = (
-                f"Real change detection analysis (algorithm: abs_diff_otsu_v1) found "
-                f"{real_change:.1f}% of the analysed area changed between the two input images. "
-                f"Registration was performed using ECC. "
-                f"Note: this is pixel-intensity change — semantic interpretation requires a land-cover model."
-            )
-        else:
-            answer = self.ANSWERS.get(demo_scenario, self.ANSWERS["demo1"])
-
-        evidence = []
-        for r in tool_results:
-            name = r.get("tool_name", "")
-            if name not in ("image_validation", "confidence_check", "answer_synthesis", "evidence_comparison"):
-                mode = r.get("execution_mode", "SIMULATED")
-                label = "✓ LIVE" if mode == ExecutionMode.LIVE_ALGORITHM else "○ DEMO"
-                evidence.append(f"{label} — {name.replace('_', ' ').title()}")
-
-        tr = self._success(
-            confidence=0.80,
-            result={
-                "final_answer": answer,
-                "evidence_points": evidence,
-                "query_answered": True,
-                "real_change_pct_used": real_change,
-            },
-            message="Final answer generated.",
-        )
-        tr.execution_mode = ExecutionMode.SIMULATED
-        tr.input_provenance = InputProvenance.SYNTHETIC_DATA
-        return tr
+        answer = synthesize(context)
+        return ToolResult(tool_name=self.name, status=ToolStatus.SUCCESS,
+                          result=answer, message="Answer assembled from executed computations and limitations.",
+                          is_demo=context.get("is_demo", False),
+                          execution_mode=ExecutionMode.LIVE_ALGORITHM,
+                          input_provenance=context.get("input_provenance", InputProvenance.UNKNOWN),
+                          algorithm="grounded_summary_v2", evidence_excludable=True)
 
 
 # ─── Tool Registry ─────────────────────────────────────────────────────────────

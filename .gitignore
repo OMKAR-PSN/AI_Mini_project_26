@@ -1,0 +1,16 @@
+# Phase 3A research artifacts only; existing subdirectory rules remain unchanged.
+research/.venv/
+research/.cache/
+research/vendor/
+research/outputs/*
+!research/outputs/.gitkeep
+research/**/__pycache__/
+research/.pytest_cache/
+research/*.egg-info/
+research/src/*.egg-info/
+research/provenance/scg_*
+research/provenance/*_info.json
+research/provenance/generator_tree.json
+research/real_cloud_annotations/images/*
+research/real_cloud_annotations/masks/*
+!research/real_cloud_annotations/**/.gitkeep

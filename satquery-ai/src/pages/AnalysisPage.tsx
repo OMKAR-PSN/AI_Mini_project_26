@@ -1,558 +1,109 @@
-// Analysis Page — Full workspace with AOI, Evidence Trail, PDF Export, Query History
-
-import { useState, useEffect, useRef } from 'react';
-import {
-  Play, RotateCcw, AlertCircle, Loader2,
-  LayoutPanelLeft, Activity, Satellite, Map, Clock,
-  FileDown, ChevronRight, ChevronDown
-} from 'lucide-react';
-import type { DemoScenario, LiveTraceItem, VisualOutput, ConfidenceLevel, EvidenceStatus, EvidenceBreakdown } from '../types';
-import { fetchDemoScenarios, runAnalysis, runDemoScenario, type AnalysisResult } from '../api/client';
+import { useEffect, useRef, useState } from 'react';
+import { Satellite, RotateCcw, FileDown } from 'lucide-react';
+import type { DemoScenario, ImageMetadata, LiveTraceItem, VisualOutput } from '../types';
+import { fetchDemoScenarios, runAnalysis, runDemoScenario, type AnalysisCallbacks, type AnalysisResult } from '../api/client';
 import QueryBox from '../components/query/QueryBox';
 import SceneSelector, { ImageMetaPanel } from '../components/query/SceneSelector';
-import TracePanel from '../components/trace/TracePanel';
-import EvidencePanel from '../components/evidence/EvidencePanel';
+import AOIMapSelector, { type AOISelection, type FetchedRealImages } from '../components/map/AOIMapSelector';
 import VisualOutputsGrid from '../components/visualization/VisualOutputs';
 import FinalAnswerCard from '../components/analysis/FinalAnswerCard';
-import AOIMapSelector, { type AOISelection } from '../components/map/AOIMapSelector';
+import EvidencePanel from '../components/evidence/EvidencePanel';
+import TracePanel from '../components/trace/TracePanel';
 import QueryHistoryPanel from '../components/history/QueryHistoryPanel';
-import { useQueryHistory } from '../hooks/useQueryHistory';
+import { useQueryHistory, type HistoryEntry } from '../hooks/useQueryHistory';
 import { generateAnalysisReport } from '../utils/reportGenerator';
 
 type Phase = 'setup' | 'running' | 'done' | 'error';
-type LeftTab = 'scene' | 'map' | 'history';
-
-interface AnalysisPageProps {
-  initialScenario?: string | null;
-}
-
-export default function AnalysisPage({ initialScenario = null }: AnalysisPageProps) {
-  // ── State ─────────────────────────────────────────────────────────────────
+export default function AnalysisPage({ initialScenario = null }: { initialScenario?: string | null }) {
   const [scenarios, setScenarios] = useState<DemoScenario[]>([]);
   const [selectedScenario, setSelectedScenario] = useState<string | null>(initialScenario);
-  const [thumbnails, setThumbnails] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [phase, setPhase] = useState<Phase>('setup');
+  const [sourceTab, setSourceTab] = useState('scene');
+  const [mobileSection, setMobileSection] = useState('setup');
+  const [loading, setLoading] = useState(true);
+  const [sceneError, setSceneError] = useState('');
   const [error, setError] = useState('');
-  const [leftTab, setLeftTab] = useState<LeftTab>('scene');
-  const [aoiSelection, setAoiSelection] = useState<AOISelection | null>(null);
-  const [exportingPdf, setExportingPdf] = useState(false);
-
-  // Trace
-  const [queryUnderstanding, setQueryUnderstanding] = useState<{taskType: string; target: string; reasoning: string} | null>(null);
-  const [strategyMessage, setStrategyMessage] = useState('');
-  const [planUpdateMessage, setPlanUpdateMessage] = useState('');
+  const [realImages, setRealImages] = useState<FetchedRealImages | null>(null);
+  const [aoi, setAOI] = useState<AOISelection | null>(null);
+  const [inputMetadata, setInputMetadata] = useState<ImageMetadata[]>([]);
+  const [thumbnails, setThumbnails] = useState<string[]>([]);
+  const [isDemo, setIsDemo] = useState(false);
   const [traceItems, setTraceItems] = useState<LiveTraceItem[]>([]);
-
-  // Results
-  const [analysisId, setAnalysisId] = useState('demo-0000-0000');
-  const [confidence, setConfidence] = useState(0);
-  const [confidenceLevel, setConfidenceLevel] = useState<ConfidenceLevel>('low');
-  const [evidenceStatus, setEvidenceStatus] = useState<EvidenceStatus>('pending');
-  const [finalAnswer, setFinalAnswer] = useState('');
-  const [evidencePoints, setEvidencePoints] = useState<string[]>([]);
-  const [visualOutputs, setVisualOutputs] = useState<VisualOutput[]>([]);
-  const [evidenceBreakdown, setEvidenceBreakdown] = useState<EvidenceBreakdown | undefined>(undefined);
-  const [evidenceFormula, setEvidenceFormula] = useState<string | undefined>(undefined);
-  const [evidenceInterpretation, setEvidenceInterpretation] = useState<string | undefined>(undefined);
-  const [hasRealImages, setHasRealImages] = useState(false);
-  // Low-evidence alert
-  const [lowEvidenceAlert, setLowEvidenceAlert] = useState<{
-    evidenceStrength: number; message: string;
-    secondaryStatus: string; secondaryReason: string;
-  } | null>(null);
-
-  const traceEndRef = useRef<HTMLDivElement>(null);
-  const { history, addEntry, clearHistory } = useQueryHistory();
-
-  // ── Load scenarios ─────────────────────────────────────────────────────────
+  const [strategy, setStrategy] = useState('');
+  const [insertion, setInsertion] = useState('');
+  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [runQuery, setRunQuery] = useState('');
+  const [runAOI, setRunAOI] = useState<string>();
+  const [exporting, setExporting] = useState(false);
+  const requestRef = useRef<AbortController | null>(null);
+  const { history, addEntry, clearHistory, storageError } = useQueryHistory();
+  useEffect(() => () => { requestRef.current?.abort(); requestRef.current = null; }, []);
   useEffect(() => {
-    fetchDemoScenarios().then(s => {
-      setScenarios(s);
-      if (!selectedScenario && s.length > 0) setSelectedScenario(s[0].scenario_id);
-    });
-  }, []);
-
-  useEffect(() => {
-    if (phase === 'running') traceEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [traceItems.length]);
-
-  useEffect(() => {
-    if (selectedScenario) {
-      const s = scenarios.find(x => x.scenario_id === selectedScenario);
-      if (s) setQuery(s.default_query);
-    }
-  }, [selectedScenario, scenarios]);
-
-  const currentScenario = scenarios.find(s => s.scenario_id === selectedScenario);
-
-  // ── Reset ─────────────────────────────────────────────────────────────────
-  const reset = () => {
-    setPhase('setup');
-    setTraceItems([]);
-    setQueryUnderstanding(null);
-    setStrategyMessage('');
-    setPlanUpdateMessage('');
-    setFinalAnswer('');
-    setEvidencePoints([]);
-    setVisualOutputs([]);
-    setThumbnails([]);
-    setError('');
-    setConfidence(0);
-    setEvidenceStatus('pending');
-    setLowEvidenceAlert(null);
-    setEvidenceBreakdown(undefined);
-    setEvidenceFormula(undefined);
-    setEvidenceInterpretation(undefined);
-    setHasRealImages(false);
-  };
-
-  // ── Run Analysis ──────────────────────────────────────────────────────────
-  const handleAnalyze = async (q: string) => {
-    reset();
-    // Inject AOI into query if selected
-    const enrichedQuery = aoiSelection ? `${q} [AOI: ${aoiSelection.name}]` : q;
-    setQuery(enrichedQuery);
-    setPhase('running');
-
-    const callbacks = {
-      onSessionCreated: (id: string) => setAnalysisId(id),
-      onQueryUnderstood: (detail: Record<string, unknown>, _msg: string) => {
-        setQueryUnderstanding({
-          taskType: String(detail.task_type || ''),
-          target: String(detail.target || ''),
-          reasoning: String(detail.reasoning || ''),
-        });
-      },
-      onStrategySelected: (_detail: Record<string, unknown>, msg: string) => setStrategyMessage(msg),
-      onToolStart: (item: Omit<LiveTraceItem, 'status'>) => {
-        setTraceItems(prev => prev.find(x => x.tool_name === item.tool_name) ? prev : [...prev, { ...item, status: 'running' as const }]);
-      },
-      onToolDone: (item: LiveTraceItem) => {
-        setTraceItems(prev => {
-          const idx = prev.findIndex(x => x.tool_name === item.tool_name);
-          if (idx >= 0) { const n = [...prev]; n[idx] = item; return n; }
-          return [...prev, item];
-        });
-      },
-      onPlanUpdated: (msg: string, _plan: string[]) => setPlanUpdateMessage(msg),
-      onThumbnails: (thumbs: string[]) => setThumbnails(thumbs),
-      onLowEvidence: (strength: number, msg: string, secStatus: string, secReason: string) => {
-        setLowEvidenceAlert({ evidenceStrength: strength, message: msg, secondaryStatus: secStatus, secondaryReason: secReason });
-      },
-      onCompleted: (result: AnalysisResult) => {
-        setConfidence(result.confidence);
-        setConfidenceLevel(result.confidenceLevel);
-        setEvidenceStatus(result.evidenceStatus);
-        setFinalAnswer(result.finalAnswer);
-        setEvidencePoints(result.evidencePoints);
-        setVisualOutputs(result.visualOutputs);
-        setEvidenceBreakdown(result.evidenceBreakdown as EvidenceBreakdown | undefined);
-        setEvidenceFormula(result.evidenceFormula);
-        setEvidenceInterpretation(result.evidenceInterpretation);
-        setHasRealImages(result.hasRealImages ?? false);
-        setPhase('done');
-
-        // Save to history
-        addEntry({
-          query: enrichedQuery,
-          scenarioId: selectedScenario,
-          confidence: result.confidence,
-          confidenceLevel: result.confidenceLevel,
-          finalAnswer: result.finalAnswer,
-          aoiName: aoiSelection?.name,
-        });
-      },
-      onError: (err: string) => { setError(err); setPhase('error'); },
+    const abort = new AbortController();
+    fetchDemoScenarios(abort.signal).then(items => { if (abort.signal.aborted) return; setScenarios(items); const selected = items.find(s => s.scenario_id === initialScenario) ?? items[0]; setSelectedScenario(selected?.scenario_id ?? null); setQuery(q => q || selected?.default_query || ''); })
+      .catch(e => { if (!abort.signal.aborted) setSceneError(e instanceof Error ? e.message : 'Scenes unavailable.'); })
+      .finally(() => { if (!abort.signal.aborted) setLoading(false); });
+    return () => abort.abort();
+  }, [initialScenario]);
+  const reset = () => { requestRef.current?.abort(); requestRef.current = null; setPhase('setup'); setResult(null); setTraceItems([]); setInputMetadata([]); setThumbnails([]); setStrategy(''); setInsertion(''); setError(''); };
+  const running = phase === 'running';
+  const selectScene = (id: string) => { if (requestRef.current) return; reset(); setRealImages(null); setSelectedScenario(id); setQuery(scenarios.find(s => s.scenario_id === id)?.default_query ?? ''); };
+  const replay = (entry: HistoryEntry) => { if (requestRef.current) return; reset(); setRealImages(null); setSelectedScenario(entry.scenarioId); setQuery(entry.query); setSourceTab('scene'); setMobileSection('setup'); };
+  const analyze = async (text: string) => {
+    if (requestRef.current || !text.trim()) return;
+    reset(); const abort = new AbortController(); requestRef.current = abort; setPhase('running'); setRunQuery(text); setRunAOI(realImages ? aoi?.name : undefined);
+    const scenario = realImages ? null : selectedScenario;
+    const callbacks: AnalysisCallbacks = {
+      onInputsResolved: (images, demo) => { setInputMetadata(images); setIsDemo(demo); },
+      onStrategySelected: (_detail, message) => setStrategy(message),
+      onPlanUpdated: (message) => setInsertion(message),
+      onThumbnails: setThumbnails,
+      onToolStart: item => setTraceItems(prev => [...prev.filter(t => t.step_index !== item.step_index), { ...item, status: 'running' as const }].sort((a, b) => a.step_index - b.step_index)),
+      onToolDone: item => setTraceItems(prev => [...prev.filter(t => t.step_index !== item.step_index), item].sort((a, b) => a.step_index - b.step_index)),
+      onCompleted: completed => { setResult(completed); setInputMetadata(completed.inputMetadata ?? []); setPhase('done'); addEntry({ query: text, scenarioId: scenario, confidence: completed.confidence, confidenceLevel: completed.confidenceLevel, finalAnswer: completed.finalAnswer, outcome: completed.outcome, aoiName: realImages ? aoi?.name : undefined }); },
+      onError: message => { setError(message); setPhase('error'); },
     };
-
-    if (selectedScenario) {
-      await runDemoScenario(selectedScenario, enrichedQuery, callbacks);
-    } else {
-      await runAnalysis(enrichedQuery, null, callbacks);
-    }
+    // Both transport cancellation and identity guarding protect against late callbacks.
+    const safe = Object.fromEntries(Object.entries(callbacks).map(([name, fn]) => [name, (...args: unknown[]) => { if (requestRef.current === abort && !abort.signal.aborted) (fn as (...values: unknown[]) => void)(...args); }])) as AnalysisCallbacks;
+    if (scenario) await runDemoScenario(scenario, text, safe, abort.signal);
+    else await runAnalysis(text, null, safe, realImages ? [realImages.before_b64, realImages.after_b64] : [], realImages ? [
+      { image_id: realImages.before_id, acquisition_date: realImages.before_date, sensor: 'Sentinel-2 (catalogue claim)', image_type: 'Optical', source: 'EarthSearch catalogue preview' },
+      { image_id: realImages.after_id, acquisition_date: realImages.after_date, sensor: 'Sentinel-2 (catalogue claim)', image_type: 'Optical', source: 'EarthSearch catalogue preview' },
+    ] : [], abort.signal);
+    if (requestRef.current === abort) requestRef.current = null;
   };
-
-  // ── PDF Export ────────────────────────────────────────────────────────────
-  const handleExportPDF = async () => {
-    setExportingPdf(true);
-    try {
-      await generateAnalysisReport({
-        query,
-        analysisId,
-        aoiName: aoiSelection?.name,
-        images: currentScenario?.images ?? [],
-        traceItems,
-        finalAnswer,
-        confidence,
-        confidenceLevel,
-        evidenceStatus,
-        evidencePoints,
-        visualOutputs,
-      });
-    } finally {
-      setExportingPdf(false);
-    }
-  };
-
-  // ── Replay from history ───────────────────────────────────────────────────
-  const handleReplay = (entry: (typeof history)[0]) => {
-    if (entry.scenarioId) setSelectedScenario(entry.scenarioId);
-    handleAnalyze(entry.query);
-    setLeftTab('scene');
-  };
-
-  const progress = phase === 'done' ? 100
-    : phase === 'running'
-    ? Math.min(90, (traceItems.filter(t => t.status === 'success' || t.status === 'warning').length / Math.max(traceItems.length, 1)) * 100)
-    : 0;
-
-  // ── Render ────────────────────────────────────────────────────────────────
-  return (
-    <div className="min-h-screen bg-rs-bg">
-
-      {/* ── Top bar ── */}
-      <div className="bg-white border-b border-rs-border sticky top-14 z-40">
-        <div className="max-w-screen-2xl mx-auto px-4 py-2.5 flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <Activity size={15} className="text-rs-teal" />
-            <span className="font-semibold text-sm text-rs-text-primary">Analysis Workspace</span>
-          </div>
-          {phase === 'running' && (
-            <div className="flex items-center gap-2 text-xs text-blue-600 font-medium">
-              <Loader2 size={13} className="animate-spin" />Agent running…
-            </div>
-          )}
-          {phase === 'done' && (
-            <div className="flex items-center gap-2 text-xs text-green-600 font-medium">
-              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-              Complete · {(confidence * 100).toFixed(0)}% confidence
-            </div>
-          )}
-          {aoiSelection && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-teal-50 border border-teal-200 text-xs text-rs-teal font-medium">
-              <Map size={11} /> {aoiSelection.name}
-            </div>
-          )}
-          <div className="ml-auto flex items-center gap-2">
-            {/* PDF Export */}
-            {phase === 'done' && (
-              <button
-                onClick={handleExportPDF}
-                disabled={exportingPdf}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rs-navy text-white text-xs font-semibold hover:bg-navy-800 transition-all disabled:opacity-60"
-              >
-                {exportingPdf
-                  ? <Loader2 size={12} className="animate-spin" />
-                  : <FileDown size={12} />
-                }
-                {exportingPdf ? 'Generating…' : 'Export PDF'}
-              </button>
-            )}
-            {phase !== 'setup' && (
-              <button onClick={reset} className="btn-ghost text-xs py-1.5 px-3">
-                <RotateCcw size={12} /> New Analysis
-              </button>
-            )}
-          </div>
-        </div>
-        {/* Progress */}
-        {(phase === 'running' || phase === 'done') && (
-          <div className="h-0.5 bg-gray-100 overflow-hidden">
-            <div
-              className={`h-full transition-all duration-500 ${phase === 'done' ? 'bg-green-400' : 'bg-rs-teal'}`}
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-        )}
-      </div>
-
-      <div className="max-w-screen-2xl mx-auto px-4 py-5">
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
-
-          {/* ── LEFT: Tabs (Scene / Map / History) ── */}
-          <div className="xl:col-span-3 space-y-4">
-
-            {/* Tab bar */}
-            <div className="flex rounded-xl overflow-hidden border border-rs-border bg-white">
-              {([
-                { id: 'scene', icon: Satellite, label: 'Scene' },
-                { id: 'map',   icon: Map,       label: 'Map AOI' },
-                { id: 'history', icon: Clock,   label: 'History', badge: history.length > 0 ? history.length : undefined },
-              ] as const).map(({ id, icon: Icon, label, badge }) => (
-                <button
-                  key={id}
-                  onClick={() => setLeftTab(id)}
-                  className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold transition-all relative ${
-                    leftTab === id
-                      ? 'bg-rs-navy text-white'
-                      : 'text-rs-text-secondary hover:bg-gray-50'
-                  }`}
-                >
-                  <Icon size={13} />
-                  {label}
-                  {badge !== undefined && (
-                    <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-rs-orange text-white text-[9px] font-bold flex items-center justify-center">
-                      {badge}
-                    </span>
-                  )}
-                </button>
-              ))}
-            </div>
-
-            {/* Scene Tab */}
-            {leftTab === 'scene' && (
-              <>
-                <div className="panel">
-                  <div className="panel-header">
-                    <span className="panel-title">Demo Scenario</span>
-                    <span className="badge badge-orange text-[10px]">Demo</span>
-                  </div>
-                  <div className="p-3">
-                    <SceneSelector
-                      scenarios={scenarios}
-                      selectedId={selectedScenario}
-                      onSelect={id => { setSelectedScenario(id); reset(); }}
-                    />
-                  </div>
-                </div>
-                {currentScenario && (
-                  <div className="panel">
-                    <div className="panel-header">
-                      <span className="panel-title">Input Images</span>
-                      <span className="text-xs text-rs-text-muted">{currentScenario.images.length} image{currentScenario.images.length > 1 ? 's' : ''}</span>
-                    </div>
-                    <div className="p-3">
-                      <ImageMetaPanel images={currentScenario.images} thumbnails={thumbnails} />
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
-
-            {/* Map Tab */}
-            {leftTab === 'map' && (
-              <div className="panel">
-                <div className="panel-header">
-                  <span className="panel-title">Area of Interest</span>
-                  {aoiSelection && <span className="badge badge-teal text-[10px]">Selected</span>}
-                </div>
-                <div className="p-3">
-                  <p className="text-xs text-rs-text-secondary mb-3 leading-snug">
-                    Select a region on the map. The AOI will be injected into your query automatically.
-                  </p>
-                  <AOIMapSelector
-                    selectedAOI={aoiSelection}
-                    onAOISelected={setAoiSelection}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* History Tab */}
-            {leftTab === 'history' && (
-              <div className="panel">
-                <div className="panel-header">
-                  <span className="panel-title">Recent Analyses</span>
-                  <span className="text-xs text-rs-text-muted">{history.length}/{10}</span>
-                </div>
-                <div className="p-3">
-                  <QueryHistoryPanel
-                    history={history}
-                    onReplay={handleReplay}
-                    onClear={clearHistory}
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* ── CENTER: Query + Visuals + Answer ── */}
-          <div className="xl:col-span-5 space-y-4">
-
-            {/* Query box */}
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title">Natural-Language Query</span>
-                {aoiSelection && (
-                  <span className="flex items-center gap-1 text-xs text-rs-teal font-medium">
-                    <Map size={11} /> AOI active
-                  </span>
-                )}
-              </div>
-              <div className="p-4">
-                <QueryBox
-                  onSubmit={handleAnalyze}
-                  disabled={phase === 'running'}
-                  initialQuery={currentScenario?.default_query || ''}
-                  key={selectedScenario}
-                />
-                {aoiSelection && (
-                  <div className="mt-2 flex items-center gap-2 text-xs text-rs-teal bg-teal-50 rounded-lg px-3 py-2 border border-teal-100">
-                    <Map size={11} className="flex-shrink-0" />
-                    AOI will be appended: <strong className="ml-1">{aoiSelection.name}</strong>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Error */}
-            {phase === 'error' && (
-              <div className="flex items-start gap-3 p-4 rounded-xl bg-red-50 border border-red-200">
-                <AlertCircle size={18} className="text-red-600 flex-shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-semibold text-red-800 text-sm">Connection Error</p>
-                  <p className="text-red-700 text-xs mt-1">{error}</p>
-                  <p className="text-red-600 text-xs mt-2 font-mono">
-                    python -m uvicorn backend.main:app --reload --port 8000
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Visual outputs */}
-            {(phase === 'running' || phase === 'done') && (
-              <div className="panel">
-                <div className="panel-header">
-                  <span className="panel-title">Visual Outputs</span>
-                  {phase === 'running' && <Loader2 size={13} className="text-rs-text-muted animate-spin" />}
-                </div>
-                <div className="p-4">
-                  {visualOutputs.length > 0 ? (
-                    <VisualOutputsGrid outputs={visualOutputs} />
-                  ) : (
-                    <div className="space-y-2">
-                      <div className="shimmer w-full h-28 rounded-xl" />
-                      <p className="text-xs text-center text-rs-text-muted">Generating analysis outputs…</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Final Answer with Evidence Trail */}
-            {phase === 'done' && finalAnswer && (
-              <FinalAnswerCard
-                query={query}
-                answer={finalAnswer}
-                confidence={confidence}
-                confidenceLevel={confidenceLevel}
-                evidenceStatus={evidenceStatus}
-                evidencePoints={evidencePoints}
-                analysisId={analysisId}
-                traceItems={traceItems}
-                images={currentScenario?.images ?? []}
-                visualOutputs={visualOutputs}
-              />
-            )}
-
-            {/* Setup placeholder */}
-            {phase === 'setup' && (
-              <div className="panel p-8 text-center">
-                <div className="w-12 h-12 rounded-2xl bg-teal-50 flex items-center justify-center mx-auto mb-4">
-                  <Play size={22} className="text-rs-teal" />
-                </div>
-                <p className="font-semibold text-rs-text-primary mb-2">Ready to Analyze</p>
-                <p className="text-sm text-rs-text-secondary">
-                  Select a scenario or draw an AOI, then ask your question.
-                </p>
-                <div className="mt-4 space-y-1.5 text-left max-w-xs mx-auto">
-                  {[
-                    ['1', 'Scene / Map AOI — choose your region'],
-                    ['2', 'Type your question'],
-                    ['3', 'Watch the agent trace run live'],
-                    ['4', 'Click "WHY THIS ANSWER?" for full evidence'],
-                    ['5', 'Export PDF report'],
-                  ].map(([n, t]) => (
-                    <div key={n} className="flex items-center gap-3 text-xs text-rs-text-secondary">
-                      <span className="w-5 h-5 rounded-full bg-navy-100 text-rs-navy font-bold flex items-center justify-center flex-shrink-0 text-[10px]">{n}</span>
-                      {t}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* ── RIGHT: Trace + Evidence ── */}
-          <div className="xl:col-span-4 space-y-4">
-
-            {/* Agent Trace */}
-            <div className="panel">
-              <div className="panel-header">
-                <div className="flex items-center gap-2">
-                  <LayoutPanelLeft size={14} className="text-rs-text-muted" />
-                  <span className="panel-title">Agent Execution Trace</span>
-                </div>
-                {phase === 'running' && (
-                  <span className="flex items-center gap-1.5 text-xs text-blue-600 font-medium">
-                    <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" /> Live
-                  </span>
-                )}
-                {phase === 'done' && (
-                  <span className="text-xs text-green-600 font-medium">Complete</span>
-                )}
-              </div>
-              <div className="p-3 max-h-96 overflow-y-auto">
-                <TracePanel
-                  items={traceItems}
-                  queryUnderstanding={queryUnderstanding ?? undefined}
-                  strategyMessage={strategyMessage}
-                  planUpdateMessage={planUpdateMessage}
-                  lowEvidenceAlert={lowEvidenceAlert}
-                />
-                <div ref={traceEndRef} />
-              </div>
-            </div>
-
-            {/* Evidence Panel */}
-            {phase === 'done' && (
-              <div className="panel animate-fade-in">
-                <div className="panel-header">
-                  <span className="panel-title">Evidence Check</span>
-                </div>
-                <div className="p-4">
-                  <EvidencePanel
-                    evidenceStatus={evidenceStatus}
-                    evidencePoints={evidencePoints}
-                    confidence={confidence}
-                    evidenceBreakdown={evidenceBreakdown}
-                    evidenceFormula={evidenceFormula}
-                    evidenceInterpretation={evidenceInterpretation}
-                    hasRealImages={hasRealImages}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* How-it-works (setup only) */}
-            {phase === 'setup' && (
-              <div className="panel p-4">
-                <p className="section-label mb-3">New Features</p>
-                <div className="space-y-2">
-                  {[
-                    { icon: Map, label: 'Map AOI', desc: 'Draw a region on the satellite map' },
-                    { icon: ChevronRight, label: 'Evidence Trail', desc: '"WHY THIS ANSWER?" button on result' },
-                    { icon: FileDown, label: 'PDF Export', desc: 'Full analysis report download' },
-                    { icon: Clock, label: 'Query History', desc: 'Last 10 analyses with replay' },
-                  ].map(({ icon: Icon, label, desc }) => (
-                    <div key={label} className="flex items-start gap-2.5 text-xs">
-                      <div className="w-6 h-6 rounded-lg bg-navy-50 flex items-center justify-center flex-shrink-0 mt-0.5">
-                        <Icon size={12} className="text-rs-navy" />
-                      </div>
-                      <div>
-                        <span className="font-semibold text-rs-text-primary">{label}</span>
-                        <span className="text-rs-text-muted ml-1">— {desc}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-        </div>
-      </div>
+  const exportReport = async () => { if (!result) return; setExporting(true); try { await generateAnalysisReport({ query: runQuery, analysisId: result.analysisId, aoiName: runAOI, images: inputMetadata, traceItems, finalAnswer: result.finalAnswer, confidence: result.confidence, confidenceLevel: result.confidenceLevel, evidenceStatus: result.evidenceStatus, evidencePoints: result.evidencePoints, visualOutputs: result.visualOutputs, outcome: result.outcome, limitations: result.limitations, verified: result.verified, scoreKind: result.scoreKind, auditHash: result.auditHash, thresholdPolicy: result.thresholdPolicy }); } catch (e) { setError(e instanceof Error ? e.message : 'Export failed.'); } finally { setExporting(false); } };
+  const outputs: VisualOutput[] = result?.visualOutputs ?? thumbnails.map((b64, i) => ({ type: i === 0 ? 'before' : 'after', label: `${isDemo ? 'Demonstration input' : 'Original observation'} ${i + 1}`, b64 }));
+  return <div>
+    <div className="workspace-toolbar"><Satellite size={18} style={{ color: 'var(--accent)' }} /><h1>Analysis workspace</h1><span className="subtle" role="status">{running ? 'Processing imagery' : result?.outcome?.replaceAll('_', ' ') ?? 'Configure an analysis'}</span>
+      <div className="ml-auto flex gap-2"><button className="btn-ghost text-xs" onClick={reset}><RotateCcw size={13} />{running ? 'Stop viewing run' : 'New analysis'}</button>{result && <button className="btn-primary text-xs" disabled={exporting} onClick={exportReport}><FileDown size={13} />{exporting ? 'Exporting…' : 'Export PDF'}</button>}</div></div>
+    {error && <p role="alert" className="notice m-3">{error}</p>}
+    <nav className="workspace-mobile-nav segmented" aria-label="Workspace sections">{['setup', 'imagery', 'results'].map(section => <button key={section} aria-pressed={mobileSection === section} onClick={() => setMobileSection(section)}>{section[0].toUpperCase() + section.slice(1)}</button>)}</nav>
+    <div className="workspace-grid">
+      <aside className="workspace-column" data-active={mobileSection === 'setup'} aria-label="Analysis setup">
+        <section className="panel"><div className="panel-header"><h2 className="panel-title">01 / Input source</h2></div><div className="p-3 space-y-3">
+          <div className="segmented" role="group" aria-label="Input source options">{['scene', 'map', 'history'].map(id => <button key={id} aria-pressed={sourceTab === id} onClick={() => setSourceTab(id)}>{id === 'scene' ? 'Scenes' : id === 'map' ? 'AOI' : 'History'}</button>)}</div>
+          <div hidden={sourceTab !== 'scene'}>{loading ? <p role="status" className="subtle">Loading local scenarios…</p> : sceneError ? <p role="alert" className="notice">{sceneError} Check the backend and reload.</p> : <SceneSelector scenarios={scenarios} selectedId={realImages ? null : selectedScenario} onSelect={selectScene} disabled={running} />}</div>
+          <div hidden={sourceTab !== 'map'}><AOIMapSelector selectedAOI={aoi} onAOISelected={setAOI} disabled={running} active={sourceTab === 'map'} onRealImagesFetched={images => { if (!requestRef.current) { setRealImages(images); if (images) { reset(); setSelectedScenario(null); } } }} /></div>
+          <div hidden={sourceTab !== 'history'}><QueryHistoryPanel history={history} onReplay={replay} onClear={clearHistory} />{storageError && <p role="status" className="notice">{storageError}</p>}</div>
+          {realImages && <p className="notice">Catalogue imagery attached. Returned acquisitions: {realImages.before_date} / {realImages.after_date}.</p>}
+          {!realImages && selectedScenario && <p className="subtle">Demonstration source. Results are excluded from scientific evaluation.</p>}
+        </div></section>
+        <section className="panel"><div className="panel-header"><h2 className="panel-title">02 / Analysis request</h2></div><div className="p-3"><QueryBox query={query} onChange={setQuery} onSubmit={analyze} running={running} canAnalyze={Boolean(realImages || selectedScenario)} />{!realImages && !selectedScenario && <p className="notice mt-3">Select a scene or retrieve imagery before submitting.</p>}</div></section>
+        {inputMetadata.length > 0 && <details className="panel p-3"><summary>Resolved input identities ({inputMetadata.length})</summary><ImageMetaPanel images={inputMetadata} thumbnails={[]} /></details>}
+        <p className="subtle">Stopping the view disconnects this browser. Server computation may finish in memory.</p>
+      </aside>
+      <section className="workspace-column" data-active={mobileSection === 'imagery'} aria-label="Imagery workspace">
+        <div className="panel"><div className="panel-header"><h2 className="panel-title">03 / Imagery workspace</h2><span className="subtle">Raster diagnostics</span></div><VisualOutputsGrid key={result?.analysisId ?? 'inputs'} outputs={outputs} isDemo={isDemo} /></div>
+        <div className="notice">Pixel diagnostics do not establish land-cover classes or geographic area. Estimated pixels are not observations.</div>
+        {running && <p role="status" className="subtle">{traceItems.filter(t => t.status !== 'running').length} tool executions returned. No completion percentage is inferred.</p>}
+      </section>
+      <aside className="workspace-column workspace-results" data-active={mobileSection === 'results'} aria-label="Results and evidence">
+        {result ? <><FinalAnswerCard query={runQuery} answer={result.finalAnswer} confidence={result.confidence} confidenceLevel={result.confidenceLevel} evidenceStatus={result.evidenceStatus} evidencePoints={result.evidencePoints} analysisId={result.analysisId} traceItems={traceItems} images={inputMetadata} visualOutputs={result.visualOutputs} auditHash={result.auditHash} outcome={result.outcome} limitations={result.limitations} verified={result.verified} scoreKind={result.scoreKind} lowEvidence={result.lowEvidence} />
+          <section className="panel p-3"><EvidencePanel evidenceStatus={result.evidenceStatus} evidencePoints={result.evidencePoints} confidence={result.confidence} evidenceBreakdown={result.evidenceBreakdown} evidenceFormula={result.evidenceFormula} evidenceInterpretation={result.evidenceInterpretation} hasRealImages={result.hasRealImages} thresholdPolicy={result.thresholdPolicy} /></section></> : <section className="panel p-4"><h2 className="panel-title">Results & evidence</h2><p className="subtle mt-3">{running ? 'Waiting for a grounded completion outcome.' : 'Run a diagnostic to inspect its summary, limitations and evidence factors.'}</p></section>}
+        <section className="panel"><div className="panel-header"><h2 className="panel-title">Execution record</h2><span className="subtle">{traceItems.length} steps</span></div><div className="p-3"><TracePanel items={traceItems} strategyMessage={strategy} planUpdateMessage={insertion} /></div></section>
+      </aside>
     </div>
-  );
+  </div>;
 }

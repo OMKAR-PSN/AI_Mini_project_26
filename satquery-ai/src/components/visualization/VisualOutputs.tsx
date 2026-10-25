@@ -1,193 +1,34 @@
-// Visual outputs — before/after slider, change map, image grid
-
-import { useState, useRef, useCallback } from 'react';
-import { Layers, Image as ImageIcon } from 'lucide-react';
+import { useState } from 'react';
+import { Image as ImageIcon, ZoomIn, ZoomOut, Maximize } from 'lucide-react';
 import type { VisualOutput } from '../../types';
-
-// ─── Before/After Slider ──────────────────────────────────────────────────────
-
-interface BeforeAfterSliderProps {
-  beforeB64: string;
-  afterB64: string;
-  beforeLabel?: string;
-  afterLabel?: string;
+function imageMeaning(output: VisualOutput, isDemo = false) {
+  const meaning = output.type === 'reconstruction' ? 'Estimated pixels · CPU inpainting' :
+    ['before', 'after', 'optical', 'sar'].includes(output.type) ? 'Original observation / supplied raster' : 'Computed diagnostic output';
+  return isDemo || /DEMO|synthetic|demonstration/i.test(output.label) ? `Demonstration imagery · ${meaning}` : meaning;
 }
-
-export function BeforeAfterSlider({
-  beforeB64, afterB64,
-  beforeLabel = 'Before', afterLabel = 'After',
-}: BeforeAfterSliderProps) {
-  const [pos, setPos] = useState(50);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const isDragging = useRef(false);
-
-  const updatePos = useCallback((clientX: number) => {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const pct = ((clientX - rect.left) / rect.width) * 100;
-    setPos(Math.max(5, Math.min(95, pct)));
-  }, []);
-
-  return (
-    <div
-      ref={containerRef}
-      className="image-compare-container rounded-xl overflow-hidden select-none"
-      style={{ height: '240px' }}
-      onMouseDown={e => { isDragging.current = true; updatePos(e.clientX); }}
-      onMouseMove={e => isDragging.current && updatePos(e.clientX)}
-      onMouseUp={() => { isDragging.current = false; }}
-      onMouseLeave={() => { isDragging.current = false; }}
-    >
-      {/* After (background) */}
-      <img
-        src={`data:image/png;base64,${afterB64}`}
-        alt={afterLabel}
-        className="absolute inset-0 w-full h-full object-cover"
-        draggable={false}
-      />
-      <div className="absolute top-2 right-2 badge badge-navy text-[10px] z-10">{afterLabel}</div>
-
-      {/* Before (clipped) */}
-      <div
-        className="absolute inset-0 overflow-hidden"
-        style={{ width: `${pos}%` }}
-      >
-        <img
-          src={`data:image/png;base64,${beforeB64}`}
-          alt={beforeLabel}
-          className="absolute inset-0 h-full object-cover"
-          style={{ width: `${100 / (pos / 100)}%`, maxWidth: 'none' }}
-          draggable={false}
-        />
-        <div className="absolute top-2 left-2 badge badge-teal text-[10px] z-10">{beforeLabel}</div>
-      </div>
-
-      {/* Handle */}
-      <div
-        className="image-compare-handle"
-        style={{ left: `calc(${pos}% - 1.5px)` }}
-      >
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 bg-white rounded-full shadow-lg flex items-center justify-center">
-          <div className="flex gap-0.5">
-            <div className="w-0.5 h-4 bg-gray-400 rounded" />
-            <div className="w-0.5 h-4 bg-gray-400 rounded" />
-          </div>
-        </div>
-      </div>
-
-      {/* Drag hint */}
-      <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[10px] text-white bg-black/40 px-2 py-0.5 rounded-full">
-        drag to compare
+export default function VisualOutputsGrid({ outputs, isDemo = false }: { outputs: VisualOutput[]; isDemo?: boolean }) {
+  const unique = outputs.filter((item, index, all) => item.b64 && all.findIndex(other => other.b64 === item.b64 && other.type === item.type) === index);
+  const [selected, setSelected] = useState('0'); const [zoom, setZoom] = useState(1); const [position, setPosition] = useState(50);
+  const [loaded, setLoaded] = useState<Record<string, { width: number; height: number }>>({}); const [failed, setFailed] = useState<string[]>([]);
+  const before = unique.find(o => o.type === 'before'); const after = unique.find(o => o.type === 'after');
+  const compare = selected === 'compare' && before && after; const item = unique[Number(selected)] ?? unique[0];
+  const first = compare ? before : item; const source = first ? `data:image/png;base64,${first.b64}` : '';
+  const sizesMatch = before && after && loaded[before.b64] && loaded[after.b64] && loaded[before.b64].width === loaded[after.b64].width && loaded[before.b64].height === loaded[after.b64].height;
+  const onLoaded = (image: HTMLImageElement, key: string) => setLoaded(prev => ({ ...prev, [key]: { width: image.naturalWidth, height: image.naturalHeight } }));
+  if (!item) return <div className="empty-view"><ImageIcon size={36} style={{ color: 'var(--text-muted)' }} /><h3 className="font-semibold">Your imagery, in context</h3><p className="subtle max-w-xs">Choose an input and run a diagnostic. Original rasters, masks and estimated outputs will appear here.</p></div>;
+  return <>
+    <div className="viewer-toolbar"><label htmlFor="image-layer" className="sr-only">Image layer</label><select id="image-layer" className="input-field text-xs" value={compare ? 'compare' : String(unique.indexOf(item))} onChange={e => { setSelected(e.target.value); setZoom(1); setPosition(50); }}>{unique.map((o, i) => <option key={`${o.type}-${i}`} value={i}>{o.label}</option>)}{before && after && <option value="compare">Compare original inputs</option>}</select>
+      <button className="btn-ghost" aria-label="Zoom out" disabled={zoom <= 1} onClick={() => setZoom(v => Math.max(1, v - .25))}><ZoomOut size={15} /></button><span className="technical">{Math.round(zoom * 100)}%</span><button className="btn-ghost" aria-label="Zoom in" disabled={zoom >= 3} onClick={() => setZoom(v => Math.min(3, v + .25))}><ZoomIn size={15} /></button><button className="btn-ghost" aria-label="Fit image and reset comparison" onClick={() => { setZoom(1); setPosition(50); }}><Maximize size={15} /></button>
+    </div>
+    <div className="viewer-stage" tabIndex={0} aria-label="Scrollable imagery viewport">
+      <div className="viewer-canvas" style={{ width: `${zoom * 100}%`, maxWidth: zoom === 1 ? '100%' : undefined }}>
+        <img src={source} alt={first.label} onLoad={e => onLoaded(e.currentTarget, first.b64)} onError={() => setFailed(prev => [...prev, first.b64])} />
+        {compare && <img className="comparison-layer" style={{ clipPath: `inset(0 ${100 - position}% 0 0)` }} src={`data:image/png;base64,${after.b64}`} alt={after.label} onLoad={e => onLoaded(e.currentTarget, after.b64)} onError={() => setFailed(prev => [...prev, after.b64])} />}
+        {compare && <span aria-hidden="true" style={{ position: 'absolute', top: 0, bottom: 0, left: `${position}%`, width: 2, background: '#fff', boxShadow: '0 0 2px #000' }} />}
       </div>
     </div>
-  );
-}
-
-// ─── Image Card ───────────────────────────────────────────────────────────────
-
-interface ImageCardProps {
-  output: VisualOutput;
-}
-
-export function ImageCard({ output }: ImageCardProps) {
-  const typeColors: Record<string, string> = {
-    change_map: 'badge-red',
-    confidence_heatmap: 'badge-orange',
-    sar_image: 'badge-navy',
-    reconstructed: 'badge-green',
-    scene_overview: 'badge-teal',
-    cloud_overlay: 'badge-orange',
-    before: 'badge-gray',
-    after: 'badge-navy',
-    optical: 'badge-teal',
-    sar: 'badge-navy',
-  };
-
-  return (
-    <div className="panel overflow-hidden group">
-      <div className="relative overflow-hidden">
-        <img
-          src={`data:image/png;base64,${output.b64}`}
-          alt={output.label}
-          className="w-full object-cover transition-transform duration-300 group-hover:scale-105"
-          style={{ height: '160px' }}
-        />
-        <div className="absolute top-2 left-2">
-          <span className={`badge text-[10px] font-bold uppercase tracking-wide ${typeColors[output.type] || 'badge-gray'}`}>
-            {output.type.replace(/_/g, ' ')}
-          </span>
-        </div>
-        <div className="absolute top-2 right-2">
-          <span className="badge badge-red text-[10px] font-bold bg-red-600 text-white uppercase">DEMO</span>
-        </div>
-      </div>
-      <div className="px-3 py-2">
-        <p className="text-xs font-semibold text-rs-text-primary">{output.label}</p>
-      </div>
-    </div>
-  );
-}
-
-// ─── Visual Outputs Grid ──────────────────────────────────────────────────────
-
-interface VisualOutputsGridProps {
-  outputs: VisualOutput[];
-}
-
-export default function VisualOutputsGrid({ outputs }: VisualOutputsGridProps) {
-  // Find before/after for slider
-  const before = outputs.find(o => o.type === 'before');
-  const after = outputs.find(o => o.type === 'after');
-  const others = outputs.filter(o => o.type !== 'before' && o.type !== 'after');
-
-  if (outputs.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center h-40 text-rs-text-muted">
-        <ImageIcon size={28} className="mb-2 opacity-40" />
-        <p className="text-sm">Visual outputs will appear after analysis</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Before/After slider if both exist */}
-      {before && after && (
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <Layers size={14} className="text-rs-text-muted" />
-            <span className="section-label">Before / After Comparison</span>
-          </div>
-          <BeforeAfterSlider
-            beforeB64={before.b64}
-            afterB64={after.b64}
-            beforeLabel={before.label}
-            afterLabel={after.label}
-          />
-        </div>
-      )}
-
-      {/* Other outputs */}
-      {others.length > 0 && (
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <ImageIcon size={14} className="text-rs-text-muted" />
-            <span className="section-label">Analysis Outputs</span>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            {others.map((o, i) => (
-              <ImageCard key={i} output={o} />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Optical/SAR side-by-side */}
-      {!before && !after && outputs.filter(o => ['optical', 'sar'].includes(o.type)).length >= 2 && (
-        <div className="grid grid-cols-2 gap-3">
-          {outputs.map((o, i) => <ImageCard key={i} output={o} />)}
-        </div>
-      )}
-    </div>
-  );
+    {failed.includes(first.b64) ? <p role="alert" className="notice">This image could not be decoded.</p> : !loaded[first.b64] && <p role="status" className="subtle p-3">Decoding image…</p>}
+    {compare && <div className="p-3 space-y-2"><div className="flex justify-between gap-3 text-xs"><span>{after.label}</span><span>{before.label}</span></div><label htmlFor="comparison-divider" className="field-label">Comparison divider · {position}%</label><input id="comparison-divider" aria-label="Comparison divider" type="range" min="0" max="100" value={position} onChange={e => setPosition(Number(e.target.value))} className="w-full" style={{ accentColor: 'var(--accent)', touchAction: 'pan-y' }} /><p className="subtle">Drag or touch the slider; use arrow keys, Home or End. Original inputs are not geospatially aligned by this viewer.</p>{loaded[before.b64] && loaded[after.b64] && !sizesMatch && <p className="notice">Input dimensions differ. The overlay fits the display bounds; it is not a pixel-aligned scientific comparison.</p>}</div>}
+    <div className="viewer-caption"><strong>{imageMeaning(first, isDemo)}</strong><p className="mt-1">{first.label}</p>{loaded[first.b64] && <p className="technical mt-1">{loaded[first.b64].width} × {loaded[first.b64].height} pixels · No coordinate overlay</p>}</div>
+  </>;
 }

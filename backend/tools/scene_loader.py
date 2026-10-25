@@ -403,18 +403,21 @@ def load_scene(scene_id: str) -> List["LoadedScene"]:
     # If it's real data and we have paths, use DiskSceneLoader
     if image_paths and all(Path(p).exists() for p in image_paths):
         loader = DiskSceneLoader()
-        acq_date = meta.get("acquisition_date") or meta.get("acquisition_date_t1")
+        dates = [meta.get("acquisition_date_t1"), meta.get("acquisition_date_t2")] if len(image_paths) == 2 else [meta.get("acquisition_date")]
         return [
             loader.load(
                 filepath=p,
                 scene_id=scene_id,
                 input_provenance=provenance,
                 sensor=sensor,
-                acquisition_date=acq_date
-            ) for p in image_paths
+                acquisition_date=dates[i]
+            ) for i, p in enumerate(image_paths)
         ]
 
-    # Fallback to synthetic if marked as such or if real data missing
+    if image_paths:
+        raise FileNotFoundError("Explicit demo assets are missing; synthetic replacement is not allowed")
+
+    # Synthetic assets are used only for explicitly synthetic demonstrations
     loader = SyntheticSceneLoader()
     # Pick a generator based on scene ID/type
     if scene_id == "demo1" or "change" in scene_id.lower():

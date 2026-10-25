@@ -43,6 +43,7 @@ class ProviderResult:
     """Checkpoint filename, if applicable."""
 
     warnings: list = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 class BaseProvider(ABC):

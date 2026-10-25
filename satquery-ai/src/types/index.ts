@@ -1,3 +1,5 @@
+export type AnalysisOutcome = "completed_supported" | "completed_partial" | "abstained" | "unsupported" | "failed";
+export interface ThresholdPolicy { low_evidence: number; high_evidence: number; research: number; }
 // SatQuery AI — TypeScript Type Definitions
 
 export type TaskType =
@@ -31,7 +33,7 @@ export type RegistrationQuality = 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'NOT_ATTEMP
 
 // Evidence strength breakdown (from evidence.py)
 export interface EvidenceFactor {
-  score: number;
+  score: number | null;
   reason: string;
   weight: number;
 }
@@ -49,14 +51,17 @@ export interface ImageMetadata {
   sensor: string;
   acquisition_date: string;
   image_type: string;
-  resolution_m: number;
+  resolution_m: number | null;
   width_px: number;
   height_px: number;
-  cloud_coverage_pct: number;
+  cloud_coverage_pct: number | null;
   cloud_status: string;
   processing_status: string;
   coordinates?: string;
   base64_thumbnail?: string;
+  source?: string;
+  provenance?: InputProvenance;
+  pixel_sha256?: string;
 }
 
 export interface ToolResult {
@@ -124,6 +129,13 @@ export interface AnalysisSession {
   low_evidence?: boolean;
   secondary_evidence_status?: string;
   has_real_images?: boolean;
+  audit_hash?: string;
+  outcome?: AnalysisOutcome;
+  limitations?: string[];
+  verified?: boolean;
+  score_kind?: string;
+  threshold_policy?: ThresholdPolicy;
+  inputs?: { metadata: ImageMetadata }[];
 }
 
 export interface DemoScenario {
@@ -210,6 +222,13 @@ export interface CompletedEvent extends SSEEvent {
   low_evidence?: boolean;
   secondary_evidence_status?: string;
   has_real_images?: boolean;
+  audit_hash?: string;
+  outcome?: AnalysisOutcome;
+  limitations?: string[];
+  verified?: boolean;
+  score_kind?: string;
+  threshold_policy?: ThresholdPolicy;
+  inputs?: { metadata: ImageMetadata }[];
 }
 
 // Low evidence SSE event

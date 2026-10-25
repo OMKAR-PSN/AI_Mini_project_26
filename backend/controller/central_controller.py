@@ -23,7 +23,7 @@ class CentralController:
     Future layer: LLM call for richer semantic interpretation (swap-in ready)
     """
 
-    CONFIDENCE_THRESHOLD = 0.75
+    from backend.tools.evidence import LOW_EVIDENCE_THRESHOLD as CONFIDENCE_THRESHOLD
     MAX_REANALYSIS = 2
 
     def interpret_query(self, query: str, image_count: int = 1) -> ControllerPlan:
@@ -74,7 +74,7 @@ class CentralController:
             )
 
         # Cloud
-        if cloud_score >= 2:
+        if cloud_score >= 1:
             return (
                 TaskType.CLOUD_ANALYSIS,
                 "Cloud contamination analysis and reconstruction",
@@ -82,7 +82,7 @@ class CentralController:
             )
 
         # Bi-temporal
-        if bi_score >= 2 or image_count == 2:
+        if bi_score >= 2 or re.search(r"\b(change|changes|before|after|temporal)\b", query) or image_count == 2:
             return (
                 TaskType.BI_TEMPORAL_CHANGE,
                 "Bi-temporal change detection analysis",
@@ -144,8 +144,8 @@ class CentralController:
         """Map tool names to human-readable step descriptions for the UI trace."""
         descriptions = {
             "image_validation": {
-                "name": "Input Validation",
-                "description": "Checking image format, alignment, and metadata",
+                "name": "Gate 1: Sensor & Nyquist Validation",
+                "description": "Deterministic check of image format, alignment, and spatial resolution limits",
             },
             "cloud_detection": {
                 "name": "Cloud Detection",
@@ -181,8 +181,8 @@ class CentralController:
                 "description": "Analysing spatial relationships (distance, adjacency, buffering)",
             },
             "evidence_comparison": {
-                "name": "Evidence Cross-Check",
-                "description": "Comparing outputs across tools for consistency",
+                "name": "Gate 2: Cross-Modal Verification",
+                "description": "Deterministic algorithmic cross-check of tool outputs for consistency",
             },
             "confidence_check": {
                 "name": "Confidence Assessment",

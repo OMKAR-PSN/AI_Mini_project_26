@@ -1,0 +1,54 @@
+schema_version: 1
+experiment_label: new_development_pilot
+dataset:
+  id: dmarsili/RSVQA-LR-2k
+  revision: 35de41f26170edda2ccc4f88c0f62f641bb9e1f1
+  split: validation
+cache_dir: research/.cache/datasets
+output_dir: research/outputs
+split_seed: 26167
+roster_seed: 20261021
+development_fraction: 0.2
+selection:
+  partition: development
+  max_scenes: 10
+  questions_per_scene: 3
+cpu_threads: 1
+cloud_seeds:
+- 101
+cloud_levels:
+- 0
+- 0.1
+- 0.2
+- 0.3
+- 0.4
+- 0.5
+- 0.6
+generator:
+  name: published
+  revision: d0787cbdc1b39a7976f89aa085f1430f3207eda6
+  opacity_threshold: 0.2
+  coverage_search_iterations: 14
+  parameters:
+    max_lvl: 1.0
+    min_lvl: 0.0
+    noise_type: perlin
+    const_scale: true
+    decay_factor: 1
+    locality_degree: 1
+    invert: false
+    channel_magnitude_shift: 0.0
+    channel_offset: 0
+    blur_scaling: 0.0
+    cloud_color: true
+repair_radius: 3
+vlm:
+  id: Qwen/Qwen2.5-VL-3B-Instruct
+  revision: 66285546d2b821cf421d4f5eb2576359d3770cd3
+  seed: 26167
+  min_pixels: 65536
+  max_pixels: 65536
+  max_new_tokens: 24
+bootstrap:
+  seed: 314159
+  iterations: 2000

@@ -72,7 +72,8 @@ class CloudDetectionResult:
 
 # ── Threshold → quality label ─────────────────────────────────────────────────
 
-RECON_THRESHOLD = 20.0   # % cloud; matches strategy_registry.CLOUD_THRESHOLD * 100
+from backend.solution_space.strategy_registry import CLOUD_THRESHOLD
+RECON_THRESHOLD = CLOUD_THRESHOLD * 100.0
 
 def _quality_label(pct: float) -> str:
     if pct < 5.0:
@@ -198,7 +199,7 @@ def detect_clouds_rgb(
         execution_mode=ExecutionMode.LIVE_ALGORITHM,
         input_provenance=input_provenance,
         processing_time_ms=processing_ms,
-        requires_reconstruction=cloud_pct >= RECON_THRESHOLD,
+        requires_reconstruction=(cloud_px / total_px) >= CLOUD_THRESHOLD,
         quality_rating=_quality_label(cloud_pct),
         brightness_threshold_used=brightness_threshold,
         whiteness_threshold_used=whiteness_threshold,

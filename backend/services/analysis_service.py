@@ -1,37 +1,19 @@
-"""
-SatQuery AI — Analysis Service
-Orchestrates the full analysis pipeline: controller → tools → evidence → synthesis.
-
-Key upgrades from prototype:
-  - Hardcoded confidence overrides removed; evidence.py drives all scores.
-  - LOW_EVIDENCE SSE event emitted when evidence_strength < threshold.
-  - Secondary evidence check: returns NO_SECONDARY_EVIDENCE_AVAILABLE honestly.
-  - Uploaded images passed to tools via context["uploaded_images"].
-  - Provenance fields (execution_mode, algorithm) forwarded through SSE.
-  - UNRELIABLE_REGISTRATION results excluded from evidence scoring.
-"""
+"""Local pipeline: resolved imagery, deterministic per-image repair, grounded summaries and recorded SSE events."""
 
 import asyncio
-import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from backend.schemas.models import (
     AnalysisSession, AnalysisInput, ImageMetadata, TaskType,
     TraceStep, ToolResult, ToolStatus, EvidenceStatus, ConfidenceLevel,
-    ControllerPlan,
 )
 from backend.schemas.provenance import (
     ExecutionMode, InputProvenance, SecondaryEvidenceStatus
 )
 from backend.controller.central_controller import CentralController
-from backend.solution_space.strategy_registry import (
-    get_strategy, maybe_insert_cloud_reconstruction
-)
-from backend.tools.specialist_tools import get_tool, TOOL_REGISTRY
-from backend.tools import demo_imagery
-from backend.tools.scene_loader import load_scene, LoadedScene
+from backend.tools.specialist_tools import get_tool
 
 
 # In-memory session store (replace with DB in production)
@@ -92,28 +74,6 @@ def get_demo_scenarios():
     return DEMO_SCENARIOS
 
 
-def _compute_confidence_level(conf: float) -> ConfidenceLevel:
-    if conf >= 0.75:
-        return ConfidenceLevel.HIGH
-    elif conf >= 0.50:
-        return ConfidenceLevel.MEDIUM
-    return ConfidenceLevel.LOW
-
-
-def _build_context(
-    session: AnalysisSession,
-    tool_results_so_far: List[ToolResult],
-    uploaded_images: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    return {
-        "query": session.query,
-        "tool_results": [r.model_dump() for r in tool_results_so_far],
-        "confidence_threshold": controller.CONFIDENCE_THRESHOLD,
-        "images": [],
-        "uploaded_images": uploaded_images or [],
-    }
-
-
 def _tool_done_event(step_i: int, tool_name: str, step_desc: Dict, result: ToolResult) -> Dict:
     """Build the tool_done SSE event dict including provenance fields."""
     return {
@@ -141,351 +101,189 @@ def _tool_done_event(step_i: int, tool_name: str, step_desc: Dict, result: ToolR
 
 
 async def run_analysis(
-    query: str,
-    demo_scenario: Optional[str] = None,
-    image_ids: Optional[List[str]] = None,
-    uploaded_images: Optional[List[str]] = None,  # list of base64 strings
+    query: str, demo_scenario: Optional[str] = None,
+    image_ids: Optional[List[str]] = None, uploaded_images: Optional[List[str]] = None,
+    image_metadata: Optional[List[Dict]] = None,
 ) -> AsyncGenerator[Dict, None]:
-    """
-    Main analysis pipeline — async generator yielding SSE trace events.
+    """Execute a deterministic queue over resolved inputs, recording every event."""
+    import hashlib
+    import json
+    from dataclasses import replace
+    from backend.services.input_resolution import resolve_inputs, pixel_hash
+    from backend.tools.scene_loader import UploadedSceneLoader
+    from backend.tools.evidence import compute_evidence_strength, LOW_EVIDENCE_THRESHOLD, HIGH_EVIDENCE_THRESHOLD, RESEARCH_THRESHOLD, eligible
+    from backend.solution_space.strategy_registry import CLOUD_THRESHOLD
+    import base64
 
-    uploaded_images: base64 PNG strings from real user uploads.
-                     When present, real CPU algorithms run on actual pixels.
-                     When absent, demo/synthetic fallbacks are used.
-    """
-    session_id = str(uuid.uuid4())
+    session = AnalysisSession(query=query, status="running", is_demo=bool(demo_scenario and not uploaded_images))
+    SESSION_STORE[session.analysis_id] = session
 
-    # ── Resolve scenario ──────────────────────────────────────────────────────
-    scenario = DEMO_SCENARIOS.get(demo_scenario, DEMO_SCENARIOS["demo1"]) if demo_scenario else DEMO_SCENARIOS["demo1"]
-    actual_scenario_key = demo_scenario or "demo1"
-    images_meta = scenario["images"]
-    has_real_images = bool(uploaded_images)
+    def emit(event):
+        session.events.append({**event, "timestamp": datetime.now(timezone.utc).isoformat()})
+        return event
 
-    # ── Create session ────────────────────────────────────────────────────────
-    session = AnalysisSession(
-        analysis_id=session_id,
-        query=query,
-        inputs=[
-            AnalysisInput(role=f"image_{i}", image_id=str(uuid.uuid4()), metadata=m)
-            for i, m in enumerate(images_meta)
-        ],
-        is_demo=not has_real_images,
-        status="running",
-    )
+    yield emit({"type": "session_created", "analysis_id": session.analysis_id})
+    limitations = []
+    forced_outcome = None
+    scenes, originals, working = [], [], []
+    try:
+        scenes, session.inputs = resolve_inputs(uploaded_images, demo_scenario, image_ids, image_metadata)
+        originals = [s.image_b64 for s in scenes]
+        working = list(scenes)
+    except Exception as exc:
+        limitations.append(f"INPUT_VALIDATION_FAILED: {exc}")
+        forced_outcome = "failed"
 
-    # ── Step 0: Controller interprets query ───────────────────────────────────
-    yield {"type": "session_created", "analysis_id": session_id}
-    yield {"type": "step", "step": "query_understanding", "status": "running",
-           "message": "Controller analysing query…"}
-    await asyncio.sleep(0.4)
+    plan = controller.interpret_query(query, image_count=len(scenes))
+    session.task_type, session.intent = plan.task_type, plan.intent
+    task = plan.task_type.value
+    if not forced_outcome and task == "bi_temporal_change":
+        if len(scenes) != 2:
+            limitations.append("MISSING_TEMPORAL_PAIR: two optical images are required.")
+            forced_outcome = "unsupported"
+        elif any(i.metadata.image_type.lower() != "optical" for i in session.inputs):
+            limitations.append("INCOMPATIBLE_MODALITY: grayscale change requires two optical inputs.")
+            forced_outcome = "unsupported"
+        elif scenes[0].image_np.shape != scenes[1].image_np.shape:
+            limitations.append("INCOMPATIBLE_DIMENSIONS: submit spatially corresponding rasters with equal dimensions.")
+            forced_outcome = "unsupported"
+        elif session.inputs[0].metadata.pixel_sha256 == session.inputs[1].metadata.pixel_sha256:
+            limitations.append("DUPLICATE_TEMPORAL_INPUT: identical pixels do not establish two acquisitions.")
+            forced_outcome = "unsupported"
+    if not forced_outcome and task == "sar_optical":
+        modalities = [i.metadata.image_type.lower() for i in session.inputs]
+        limitations.append("SAR processing is unavailable." if "sar" in modalities else "MISSING_SAR: no identified SAR input; SAR processing is unavailable.")
+        forced_outcome = "unsupported"
+    if not forced_outcome and any(i.metadata.image_type.lower() != "optical" for i in session.inputs):
+        limitations.append("INCOMPATIBLE_MODALITY: RGB cloud processing supports optical inputs only.")
+        forced_outcome = "unsupported"
 
-    plan: ControllerPlan = controller.interpret_query(query, image_count=len(images_meta))
-    session.task_type = plan.task_type
-    session.intent = plan.intent
-
-    yield {
-        "type": "step", "step": "query_understanding", "status": "done",
-        "message": plan.intent,
-        "detail": {
-            "task_type": plan.task_type.value,
-            "target": plan.target,
-            "spatial_reference": plan.spatial_reference,
-            "dates": plan.dates,
-            "requires_sar": plan.requires_sar,
-            "reasoning": plan.reasoning,
-        },
-    }
-
-    if actual_scenario_key == "demo3":
-        plan.task_type = TaskType.BI_TEMPORAL_CHANGE
-
-    # ── Step 1: Strategy selection ────────────────────────────────────────────
-    yield {"type": "step", "step": "strategy_selection", "status": "running",
-           "message": "Selecting analysis pipeline…"}
-    await asyncio.sleep(0.3)
-
-    tool_plan = get_strategy(plan.task_type)
-    step_descriptions = controller.generate_step_descriptions(tool_plan)
-
-    yield {
-        "type": "step", "step": "strategy_selection", "status": "done",
-        "message": f"{plan.task_type.value.replace('_', ' ').title()} pipeline selected.",
-        "detail": {"tools": tool_plan, "steps": step_descriptions},
-    }
-
-    session.plan = tool_plan
-
-    # ── Thumbnails ────────────────────────────────────────────────────────────
-    thumbnails = []
-    loaded_scenes = []
-    
-    if uploaded_images and len(uploaded_images) >= 2:
-        thumbnails = uploaded_images[:2]   # Use real uploaded images as thumbnails
-    elif actual_scenario_key:
+    yield emit({"type": "inputs_resolved", "inputs": [i.model_dump(mode="json") for i in session.inputs], "is_demo": session.is_demo})
+    yield emit({"type": "step", "step": "query_understanding", "status": "done", "message": plan.intent,
+                "detail": {"task_type": task, "image_count": len(scenes), "requires_sar": plan.requires_sar}})
+    queue = []
+    if not forced_outcome:
+        queue = [("image_validation", None, False)] + [("cloud_detection", i, False) for i in range(len(scenes))]
+        if task == "bi_temporal_change":
+            queue.append(("bi_temporal_change_detection", None, False))
+    session.plan = [n for n, _, _ in queue] + ["answer_synthesis"]
+    yield emit({"type": "step", "step": "strategy_selection", "status": "done", "message": "Local algorithm pipeline selected.", "detail": {"tools": session.plan}})
+    yield emit({"type": "thumbnails", "thumbnails": originals})
+    masks, repaired, repair_failed = {}, set(), set()
+    index = 0
+    while index < len(queue):
+        name, input_index, inserted = queue[index]
+        desc = {"step_name": name.replace("_", " ").title() + (f" — image {input_index+1}" if input_index is not None else ""), "is_auto_inserted": inserted}
+        yield emit({"type": "tool_start", "step_index": index, "tool_name": name, **desc})
+        selected = [working[input_index]] if input_index is not None else working
+        context = {"query": query, "task_type": task, "tool_results": [r.model_dump() for r in session.tool_results],
+                   "uploaded_images": [s.image_b64 for s in selected], "input_provenance": selected[0].input_provenance,
+                   "cloud_mask_b64": masks.get(input_index), "is_demo": session.is_demo}
         try:
-            loaded_scenes = load_scene(actual_scenario_key)
-            if loaded_scenes:
-                thumbnails = [s.image_b64 for s in loaded_scenes]
-                # Populate uploaded_images so legacy pipeline still sees bytes
-                if not uploaded_images:
-                    uploaded_images = thumbnails
-        except Exception as e:
-            print(f"Error loading scene {actual_scenario_key}: {e}")
-            # Fallback to demo_imagery if registry fails
-            if actual_scenario_key == "demo1":
-                thumbnails = [
-                    demo_imagery.generate_urban_scene("2024", expansion_factor=0.0),
-                    demo_imagery.generate_urban_scene("2026", expansion_factor=0.6),
-                ]
-            elif actual_scenario_key == "demo2":
-                thumbnails = [
-                    demo_imagery.generate_urban_scene("2025", expansion_factor=0.3),
-                    demo_imagery.generate_sar_image(),
-                ]
-            elif actual_scenario_key == "demo3":
-                thumbnails = [
-                    demo_imagery.generate_urban_scene("2026-Jan", expansion_factor=0.1),
-                    demo_imagery.generate_cloud_image(),
-                ]
-
-    yield {"type": "thumbnails", "thumbnails": thumbnails}
-
-    # ── Execute tools ─────────────────────────────────────────────────────────
-    tool_results_accumulated: List[ToolResult] = []
-    current_plan = list(tool_plan)
-    cloud_reconstruction_auto_inserted = False
-    cloud_mask_b64_from_detection: Optional[str] = None
-
-    for step_i, tool_name in enumerate(current_plan):
-        step_desc = next(
-            (s for s in step_descriptions if s["tool_name"] == tool_name),
-            {"step_name": tool_name, "description": "", "is_auto_inserted": False},
-        )
-
-        yield {
-            "type": "tool_start",
-            "step_index": step_i,
-            "tool_name": tool_name,
-            "step_name": step_desc.get("step_name", tool_name),
-            "description": step_desc.get("description", ""),
-            "is_auto_inserted": step_desc.get("is_auto_inserted", False) or (
-                tool_name == "cloud_reconstruction" and cloud_reconstruction_auto_inserted
-            ),
-        }
-
-        await asyncio.sleep(
-            0.8 if tool_name in ("cloud_reconstruction", "bi_temporal_change_detection") else 0.4
-        )
-
-        context = _build_context(session, tool_results_accumulated, uploaded_images)
-        context["demo_scenario"] = actual_scenario_key
-        context["target"] = plan.target
-        context["scene_id"] = actual_scenario_key if not has_real_images else None
-
-        # Pass cloud mask from detection step to reconstruction step
-        if tool_name == "cloud_reconstruction" and cloud_mask_b64_from_detection:
-            context["cloud_mask_b64"] = cloud_mask_b64_from_detection
-
-        # Build inputs: real images go into "images" list
-        tool_inputs: Dict[str, Any] = {
-            "images": uploaded_images or [],
-            "loaded_scenes": loaded_scenes,
-            "metadata": [],
-            "params": {},
-            "context": context,
-        }
-
-        try:
-            tool = get_tool(tool_name)
-            result = tool.timed_run(tool_inputs)
-        except Exception as e:
-            result = ToolResult(
-                tool_name=tool_name,
-                status=ToolStatus.ERROR,
-                confidence=0.0,
-                result={},
-                message=f"Tool error: {str(e)}",
-                is_demo=True,
-                execution_mode=ExecutionMode.SIMULATED,
-                input_provenance=InputProvenance.UNKNOWN,
-            )
-
-        # Capture cloud mask for reconstruction step
-        if tool_name == "cloud_detection":
-            mask = result.metadata.get("mask_b64") or result.result.get("cloud_mask_b64")
-            if mask:
-                cloud_mask_b64_from_detection = mask
-
-        tool_results_accumulated.append(result)
+            result = await asyncio.to_thread(get_tool(name).timed_run, {
+                "images": context["uploaded_images"], "loaded_scenes": selected,
+                "metadata": [i.metadata.model_dump() for i in session.inputs], "context": context, "params": {}})
+        except Exception as exc:
+            result = ToolResult(tool_name=name, status=ToolStatus.ERROR, message=f"Algorithm failure: {exc}",
+                                execution_mode=ExecutionMode.LIVE_ALGORITHM, evidence_excludable=True)
+        if result.execution_mode is None:
+            result.execution_mode = ExecutionMode.LIVE_ALGORITHM
+        result.input_provenance = selected[0].input_provenance
+        result.is_demo = session.is_demo or any(s.input_provenance in (InputProvenance.SYNTHETIC_DATA, InputProvenance.DEMO_ASSET) for s in selected)
+        result.metadata.update({"input_index": input_index, "input_pixel_hashes": [pixel_hash(s) for s in selected]})
+        if result.status in (ToolStatus.ERROR, ToolStatus.SKIPPED) or result.is_demo:
+            result.evidence_excludable = True
+        if name == "cloud_detection" and result.execution_mode == ExecutionMode.LIVE_ALGORITHM and result.status != ToolStatus.ERROR:
+            session.inputs[input_index].metadata.cloud_coverage_pct = result.result.get("cloud_coverage_pct")
+            session.inputs[input_index].metadata.cloud_status = "RGB candidates measured"
+            masks[input_index] = result.visual_output
+            fraction = result.result.get("cloud_pixel_count", 0) / max(1, result.result.get("total_pixel_count", 1))
+            result.metadata["mask_sha256"] = hashlib.sha256(base64.b64decode(masks[input_index])).hexdigest() if masks[input_index] else None
+            if fraction >= CLOUD_THRESHOLD and masks[input_index]:
+                queue.insert(index+1, ("cloud_reconstruction", input_index, True))
+                session.plan = [n for n, _, _ in queue] + ["answer_synthesis"]
+                reason = f"Image {input_index+1}: measured cloud fraction {fraction:.6f} >= policy {CLOUD_THRESHOLD}; local CPU inpainting requested."
+                result.metadata["injection_reason"] = reason
+                yield emit({"type": "plan_updated", "message": reason, "new_plan": session.plan, "inserted_tool": "cloud_reconstruction", "input_index": input_index})
+        if name == "cloud_reconstruction":
+            if result.status == ToolStatus.SUCCESS and result.result.get("success") and result.visual_output:
+                decoded = UploadedSceneLoader().load(base64.b64decode(result.visual_output))
+                working[input_index] = replace(working[input_index], image_np=decoded.image_np, image_b64=decoded.image_b64)
+                repaired.add(input_index)
+                result.metadata["output_pixel_hash"] = pixel_hash(working[input_index])
+            else:
+                repair_failed.add(input_index)
+            result.evidence_excludable = True  # interpolation is not independent supporting evidence
+        if name == "bi_temporal_change_detection" and (repaired or repair_failed):
+            result.evidence_excludable = True
+            result.result["changed_area_pct"] = None
+            result.result["changed_pixel_count"] = None
+            result.result["unchanged_pixel_count"] = None
+            result.message = "Change reporting withheld because inputs contain cloud-affected or estimated pixels."
+            result.visual_output = None
+            result.metadata.pop("heatmap_b64", None)
+            result.warnings.append("Change reporting withheld: cloud-affected or estimated pixels require a validated clear-pixel comparison protocol.")
+        if name == "cloud_detection" and task != "cloud_analysis":
+            result.evidence_excludable = True  # quality checks cannot support semantic/change answers
+        if result.status == ToolStatus.ERROR:
+            limitations.append(f"{name} failed: {result.message}")
         session.tool_results.append(result)
+        session.trace.append(TraceStep(step_index=index, step_name=desc["step_name"], description=result.message,
+            status=result.status, tool_name=name, tool_result=result, timestamp=datetime.now(timezone.utc).isoformat(), is_auto_inserted=inserted))
+        yield emit(_tool_done_event(index, name, desc, result))
+        if name == "image_validation" and (result.status != ToolStatus.SUCCESS or not result.result.get("all_valid")):
+            limitations.append("Image validation failed; downstream processing stopped.")
+            forced_outcome = "failed"
+            break
+        index += 1
 
-        yield _tool_done_event(step_i, tool_name, step_desc, result)
-
-        # ── Dynamic cloud reconstruction insertion ────────────────────────────
-        if tool_name == "cloud_detection" and result.result.get("requires_reconstruction", False):
-            updated_plan, inserted = maybe_insert_cloud_reconstruction(
-                list(current_plan),
-                result.result.get("cloud_coverage_pct", 0) / 100,
-            )
-            if inserted:
-                cloud_reconstruction_auto_inserted = True
-                current_plan = updated_plan
-                step_descriptions = controller.generate_step_descriptions(current_plan)
-                yield {
-                    "type": "plan_updated",
-                    "message": "⚡ Cloud contamination detected! Agent automatically inserted Cloud Reconstruction step.",
-                    "new_plan": current_plan,
-                    "new_steps": step_descriptions,
-                    "inserted_tool": "cloud_reconstruction",
-                }
-
-    # ── Evidence aggregation (real, not hardcoded) ────────────────────────────
-    from backend.tools.evidence import compute_evidence_strength, LOW_EVIDENCE_THRESHOLD
-
-    tool_results_dicts = [r.model_dump() for r in tool_results_accumulated]
-    ev = compute_evidence_strength(tool_results_dicts)
-    final_conf = ev.evidence_strength
-
-    session.confidence = final_conf
-    session.confidence_level = _compute_confidence_level(final_conf)
-
-    # ── LOW EVIDENCE event ────────────────────────────────────────────────────
+    if not forced_outcome and session.tool_results and all(r.status == ToolStatus.ERROR for r in session.tool_results if r.tool_name != "image_validation"):
+        forced_outcome = "failed"
+    answer_context = {"query": query, "task_type": task, "tool_results": [r.model_dump() for r in session.tool_results],
+                      "limitations": limitations, "forced_outcome": forced_outcome, "is_demo": session.is_demo,
+                      "input_provenance": scenes[0].input_provenance if scenes else InputProvenance.UNKNOWN}
+    answer_index = len(session.trace)
+    yield emit({"type": "tool_start", "step_index": answer_index, "tool_name": "answer_synthesis", "step_name": "Grounded summary"})
+    answer = get_tool("answer_synthesis").timed_run({"context": answer_context})
+    session.tool_results.append(answer)
+    session.trace.append(TraceStep(step_index=answer_index, step_name="Grounded summary", description=answer.message,
+        status=answer.status, tool_name=answer.tool_name, tool_result=answer, timestamp=datetime.now(timezone.utc).isoformat()))
+    yield emit(_tool_done_event(answer_index, answer.tool_name, {"step_name": "Grounded summary"}, answer))
+    session.final_answer = answer.result["final_answer"]
+    session.status = answer.result["outcome"]
+    dictionaries = [r.model_dump(mode="json") for r in session.tool_results]
+    ev = compute_evidence_strength(dictionaries)
+    session.confidence = ev.evidence_strength
+    session.confidence_level = ConfidenceLevel.HIGH if ev.evidence_strength >= HIGH_EVIDENCE_THRESHOLD else ConfidenceLevel.MEDIUM if ev.evidence_strength >= LOW_EVIDENCE_THRESHOLD else ConfidenceLevel.LOW
+    session.evidence_status = EvidenceStatus.INSUFFICIENT  # no independent same-claim verification exists
+    session.evidence_points = [f"Computed: {r.tool_name} ({r.algorithm})" for r in session.tool_results if eligible(r.model_dump())]
+    visuals = [{"type": "before" if i==0 else "after", "label": f"Original image {i+1} — {session.inputs[i].metadata.acquisition_date}", "b64": img} for i, img in enumerate(originals)]
+    for r in session.tool_results:
+        if r.visual_output and r.execution_mode == ExecutionMode.LIVE_ALGORITHM:
+            visuals.append({"type": "reconstruction" if r.visual_type=="reconstructed" else r.visual_type or "image", "label": f"{'DEMONSTRATION: ' if r.is_demo else ''}{r.tool_name} — {r.algorithm}", "b64": r.visual_output})
+    session.visual_outputs = visuals
+    session.completed_at = datetime.now(timezone.utc).isoformat()
+    digest_payload = {"pipeline": "phase1_v2", "query": query, "inputs": [i.model_dump(mode="json") for i in session.inputs],
+                      "plan": session.plan, "results": dictionaries, "evidence": ev.breakdown, "outcome": session.status,
+                      "policy": {"cloud": CLOUD_THRESHOLD, "low_evidence": LOW_EVIDENCE_THRESHOLD}}
+    session.audit_manifest = digest_payload
+    digest = hashlib.sha256(json.dumps(digest_payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    session.completion = {"type": "completed", "analysis_id": session.analysis_id, "outcome": session.status,
+        "confidence": session.confidence, "confidence_level": session.confidence_level.value,
+        "evidence_status": session.evidence_status.value, "final_answer": session.final_answer,
+        "evidence_points": session.evidence_points, "visual_outputs": visuals, "conflicts": [],
+        "evidence_breakdown": ev.breakdown, "evidence_formula": ev.formula, "evidence_interpretation": ev.interpretation,
+        "low_evidence": ev.low_evidence, "has_real_images": bool(scenes) and not session.is_demo,
+        "audit_hash": digest, "verified": False, "limitations": answer.result["limitations"],
+        "inputs": [i.model_dump(mode="json") for i in session.inputs],
+        "threshold_policy": {"low_evidence": LOW_EVIDENCE_THRESHOLD, "high_evidence": HIGH_EVIDENCE_THRESHOLD, "research": RESEARCH_THRESHOLD},
+        "score_kind": "heuristic_evidence", "secondary_evidence_status": "NO_SECONDARY_EVIDENCE_AVAILABLE"}
     if ev.low_evidence:
-        yield {
-            "type": "low_evidence",
-            "evidence_strength": final_conf,
-            "threshold": LOW_EVIDENCE_THRESHOLD,
-            "message": (
-                f"Evidence strength ({final_conf:.2f}) below threshold ({LOW_EVIDENCE_THRESHOLD}). "
-                f"Checking for secondary evidence sources…"
-            ),
-            "secondary_evidence_status": (
-                ev.secondary_evidence_status.value if ev.secondary_evidence_status else
-                SecondaryEvidenceStatus.NO_SECONDARY_EVIDENCE_AVAILABLE.value
-            ),
-            "secondary_evidence_reason": ev.secondary_evidence_reason or (
-                "No genuinely independent secondary evidence source is available. "
-                "A secondary analysis was NOT manufactured."
-            ),
-        }
-        await asyncio.sleep(0.3)
-
-    # ── Evidence status ───────────────────────────────────────────────────────
-    has_conflict = any(
-        r.result.get("agreement") is False
-        for r in tool_results_accumulated
-    )
-    session.evidence_status = EvidenceStatus.CONFLICTING if has_conflict else EvidenceStatus.CONSISTENT
-
-    # ── Evidence points (live vs demo clearly labelled) ───────────────────────
-    evidence = []
-    for r in tool_results_accumulated:
-        if r.tool_name not in ("image_validation", "confidence_check", "answer_synthesis", "evidence_comparison"):
-            mode = r.execution_mode.value if r.execution_mode else "SIMULATED"
-            label = "LIVE" if mode == ExecutionMode.LIVE_ALGORITHM else "DEMO"
-            evidence.append(f"[{label}] {r.tool_name.replace('_', ' ').title()}")
-    session.evidence_points = evidence
-
-    # ── Final answer ──────────────────────────────────────────────────────────
-    answer_tool = get_tool("answer_synthesis")
-    answer_context = {
-        "demo_scenario": actual_scenario_key,
-        "query": query,
-        "tool_results": tool_results_dicts,
-        "uploaded_images": uploaded_images or [],
-    }
-    answer_result = answer_tool.timed_run({
-        "images": uploaded_images or [],
-        "metadata": [],
-        "params": {},
-        "context": answer_context,
-    })
-    session.final_answer = answer_result.result.get("final_answer", "")
-
-    # ── Visual outputs ────────────────────────────────────────────────────────
-    vis_outputs = []
-
-    # Collect real visual outputs from tools first
-    for r in tool_results_accumulated:
-        if r.visual_output and r.visual_type:
-            if r.tool_name == "bi_temporal_change_detection" and r.visual_type == "change_map":
-                vis_outputs.append({
-                    "type": "change_map",
-                    "label": "Change Map (LIVE_ALGORITHM)",
-                    "b64": r.visual_output,
-                })
-                if r.metadata.get("heatmap_b64"):
-                    vis_outputs.append({
-                        "type": "confidence_heatmap",
-                        "label": "Difference Heatmap (LIVE_ALGORITHM)",
-                        "b64": r.metadata["heatmap_b64"],
-                    })
-            elif r.tool_name == "cloud_detection" and r.visual_type == "cloud_mask":
-                vis_outputs.append({
-                    "type": "cloud_mask",
-                    "label": "Cloud Mask (LIVE_ALGORITHM)",
-                    "b64": r.visual_output,
-                })
-            elif r.tool_name == "cloud_reconstruction" and r.visual_type == "reconstructed":
-                vis_outputs.append({
-                    "type": "reconstruction",
-                    "label": f"Reconstruction ({r.algorithm or 'CPU baseline'})",
-                    "b64": r.visual_output,
-                })
-
-    # Add input thumbnails if not already represented
-    if thumbnails:
-        if actual_scenario_key in ("demo1", "demo3"):
-            labels = ["Before", "After"]
-            if actual_scenario_key == "demo1":
-                labels = ["Before (2024)", "After (2026)"]
-            elif actual_scenario_key == "demo3":
-                labels = ["Before (Jan 2026)", "After (Feb 2026) — Cloud contaminated"]
-            for i, (thumb, label) in enumerate(zip(thumbnails, labels)):
-                vis_outputs.insert(i, {"type": "before" if i == 0 else "after", "label": label, "b64": thumb})
-        elif actual_scenario_key == "demo2":
-            vis_outputs.insert(0, {"type": "optical", "label": "Optical (Sentinel-2)", "b64": thumbnails[0]})
-            vis_outputs.insert(1, {"type": "sar", "label": "SAR [DEMO] — SAR_NOT_AVAILABLE", "b64": thumbnails[1] if len(thumbnails) > 1 else ""})
-
-    # Demo fallback: add change map if no real one was produced
-    if not any(v["type"] == "change_map" for v in vis_outputs):
-        if actual_scenario_key in ("demo1", "demo3"):
-            vis_outputs.append({
-                "type": "change_map",
-                "label": "Change Map [DEMO]",
-                "b64": demo_imagery.generate_change_map(),
-            })
-            vis_outputs.append({
-                "type": "confidence_heatmap",
-                "label": "Confidence Heatmap [DEMO]",
-                "b64": demo_imagery.generate_confidence_heatmap(),
-            })
-
-    session.visual_outputs = vis_outputs
-    session.status = "completed"
-    session.completed_at = datetime.utcnow().isoformat()
-    SESSION_STORE[session_id] = session
-
-    yield {
-        "type": "completed",
-        "analysis_id": session_id,
-        "confidence": final_conf,
-        "confidence_level": session.confidence_level.value,
-        "evidence_status": session.evidence_status.value,
-        "final_answer": session.final_answer,
-        "evidence_points": session.evidence_points,
-        "visual_outputs": vis_outputs,
-        "conflicts": session.conflicts,
-        # Evidence breakdown for the WHY THIS ANSWER panel
-        "evidence_breakdown": ev.breakdown,
-        "evidence_formula": ev.formula,
-        "evidence_interpretation": ev.interpretation,
-        "low_evidence": ev.low_evidence,
-        "secondary_evidence_status": (
-            ev.secondary_evidence_status.value if ev.secondary_evidence_status else None
-        ),
-        "has_real_images": has_real_images,
-    }
+        yield emit({"type": "low_evidence", "evidence_strength": ev.evidence_strength,
+                    "threshold": LOW_EVIDENCE_THRESHOLD, "message": "Insufficient supporting heuristic evidence.",
+                    "secondary_evidence_status": "NO_SECONDARY_EVIDENCE_AVAILABLE",
+                    "secondary_evidence_reason": "No independent comparison was performed."})
+    yield emit(session.completion)
 
 
 def get_session(analysis_id: str) -> Optional[AnalysisSession]:

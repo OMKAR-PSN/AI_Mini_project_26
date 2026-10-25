@@ -41,6 +41,12 @@ class CPUInpaintingProvider(BaseProvider):
     INPAINT_RADIUS = 10  # pixels
     LARGE_MASK_THRESHOLD = 0.30  # switch to NS above 30% mask coverage
 
+    def __init__(self, algorithm="auto", radius=10):
+        if algorithm not in ("auto", "telea", "navier_stokes") or radius <= 0:
+            raise ValueError("Expected auto/telea/navier_stokes and positive radius")
+        self.algorithm = algorithm
+        self.radius = radius
+
     @property
     def name(self) -> str:
         return "CPUInpaintingProvider"
@@ -89,9 +95,14 @@ class CPUInpaintingProvider(BaseProvider):
             # Binarise: any pixel > 127 is treated as cloud
             _, binary_mask = cv2.threshold(mask_1ch.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
 
+            if binary_mask.shape != img_np.shape[:2]:
+                raise ValueError("Mask dimensions must exactly match source image")
+
             # Choose algorithm based on mask coverage
             mask_coverage = np.mean(binary_mask > 0)
-            if mask_coverage > self.LARGE_MASK_THRESHOLD:
+            if mask_coverage >= 1.0:
+                raise ValueError("Fully masked input has no observed pixels to support inpainting")
+            if self.algorithm == "navier_stokes" or (self.algorithm == "auto" and mask_coverage > self.LARGE_MASK_THRESHOLD):
                 flags = cv2.INPAINT_NS
                 algo_name = "opencv_navier_stokes_inpaint"
                 algo_note = "Navier-Stokes (large mask)"
@@ -101,18 +112,10 @@ class CPUInpaintingProvider(BaseProvider):
                 algo_note = "Telea (small/medium mask)"
 
             # Inpaint
-            result_np = cv2.inpaint(img_np, binary_mask, self.INPAINT_RADIUS, flags)
+            result_np = cv2.inpaint(img_np, binary_mask, self.radius, flags)
 
-            # Annotate output with honest label
+            # Scientific pixels are never annotated. Captions belong in the UI.
             pil_result = Image.fromarray(result_np)
-            from PIL import ImageDraw
-            draw = ImageDraw.Draw(pil_result)
-            draw.rectangle([0, 0, 300, 16], fill=(0, 100, 60))
-            draw.text(
-                (4, 2),
-                f"CPU BASELINE: {algo_note}  |  NOT EMRDM",
-                fill=(255, 255, 255),
-            )
 
             # Encode output
             buf = io.BytesIO()
@@ -133,13 +136,14 @@ class CPUInpaintingProvider(BaseProvider):
                     f"This is a lightweight CPU baseline — NOT EMRDM."
                 ),
                 runtime_ms=runtime_ms,
+                metadata={"radius_px": self.radius, "mask_fraction": float(mask_coverage), "algorithm": algo_name, "processing_time_ms": runtime_ms},
                 model_id=None,
                 checkpoint=None,
                 warnings=[
-                    "Result is OpenCV inpainting, not a learned diffusion model.",
+                    "Inpainted pixels are estimates, not measured ground truth.",
                     "Quality degrades significantly for large masked areas (>30%).",
                 ] if mask_coverage > 0.20 else [
-                    "Result is OpenCV inpainting, not a learned diffusion model.",
+                    "Inpainted pixels are estimates, not measured ground truth.",
                 ],
             )
 
@@ -151,5 +155,6 @@ class CPUInpaintingProvider(BaseProvider):
                 input_provenance=input_provenance,
                 success=False,
                 message=f"CPU inpainting failed: {exc}",
+                runtime_ms=int((time.monotonic() - start_ms) * 1000),
                 warnings=[str(exc)],
             )

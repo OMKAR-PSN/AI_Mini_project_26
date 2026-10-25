@@ -75,7 +75,7 @@ class ChangeDetectionResult:
     unreliable_registration: bool             # True → exclude from evidence
     registration_quality: RegistrationQuality
     registration_method: str
-    registration_error_px: Optional[float]
+    registration_intensity_residual: Optional[float]
 
     # Imagery
     change_mask_b64: Optional[str]            # None when unreliable
@@ -174,7 +174,7 @@ def detect_change(
     reg: RegistrationResult = register_images(t1, t2)
 
     # ── REGISTRATION FAILED → stop, do not compute change % ──────────────────
-    if reg.quality == RegistrationQuality.FAILED:
+    if reg.quality != RegistrationQuality.SUCCESS:
         elapsed_ms = int((time.monotonic() - t_start) * 1000)
         return ChangeDetectionResult(
             changed_area_pct=None,
@@ -184,7 +184,7 @@ def detect_change(
             unreliable_registration=True,
             registration_quality=reg.quality,
             registration_method=reg.method,
-            registration_error_px=reg.mean_alignment_error_px,
+            registration_intensity_residual=reg.mean_absolute_intensity_residual,
             change_mask_b64=None,
             change_heatmap_b64=None,
             t1_shape=t1_shape,
@@ -213,7 +213,7 @@ def detect_change(
 
     if reg.quality == RegistrationQuality.PARTIAL:
         warnings.append(
-            f"Registration quality is PARTIAL (error={reg.mean_alignment_error_px:.1f}px). "
+            f"Registration quality is PARTIAL (error={reg.mean_absolute_intensity_residual:.1f} intensity levels). "
             f"Change percentage is computed but flagged as potentially unreliable."
         )
 
@@ -258,7 +258,7 @@ def detect_change(
     changed_pct = round(changed_px / total_px * 100.0, 2)
 
     # ── Encode outputs ────────────────────────────────────────────────────────
-    mask_b64 = _annotate_mask(final_mask)
+    mask_b64 = _encode_image(final_mask)
     heatmap_b64 = _build_heatmap(diff_norm)
 
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
@@ -273,7 +273,7 @@ def detect_change(
         unreliable_registration=unreliable,
         registration_quality=reg.quality,
         registration_method=reg.method,
-        registration_error_px=reg.mean_alignment_error_px,
+        registration_intensity_residual=reg.mean_absolute_intensity_residual,
         change_mask_b64=mask_b64,
         change_heatmap_b64=heatmap_b64,
         t1_shape=t1_shape,
@@ -288,7 +288,7 @@ def detect_change(
         message=(
             f"Change detection complete ({reg.quality.value}). "
             f"Changed area: {changed_pct:.1f}%. "
-            f"Registration: {reg.method} ({reg.mean_alignment_error_px or 'n/a'}px error)."
+            f"Registration: {reg.method} ({reg.mean_absolute_intensity_residual or 'n/a'} intensity residual)."
         ),
         warnings=warnings,
     )

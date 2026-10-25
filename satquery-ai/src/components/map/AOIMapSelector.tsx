@@ -1,10 +1,11 @@
-// AOIMapSelector.tsx — Leaflet map for selecting an Area of Interest
+// AOIMapSelector.tsx — Leaflet map with AOI drawing + Real Sentinel-2 imagery fetcher
 
 import { useEffect, useRef, useState } from 'react';
-import { MapPin, Square, RotateCcw, CheckCircle2 } from 'lucide-react';
-
-// Import Leaflet lazily to avoid SSR issues
-import type { Map as LeafletMap, Rectangle as LeafletRectangle, LatLngBounds } from 'leaflet';
+import { MapPin } from 'lucide-react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import type { Map as LeafletMap, Rectangle as LeafletRectangle } from 'leaflet';
+import { fetchRealImagery } from '../../api/client';
 
 interface AOI {
   name: string;
@@ -40,248 +41,55 @@ const PRESET_AOIS: AOI[] = [
   },
 ];
 
-export interface AOISelection {
-  name: string;
-  bounds: [[number, number], [number, number]];
-}
-
-interface AOIMapSelectorProps {
-  onAOISelected: (aoi: AOISelection | null) => void;
-  selectedAOI: AOISelection | null;
-}
-
-export default function AOIMapSelector({ onAOISelected, selectedAOI }: AOIMapSelectorProps) {
-  const mapRef = useRef<LeafletMap | null>(null);
-  const rectRef = useRef<LeafletRectangle | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [mapReady, setMapReady] = useState(false);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [activePreset, setActivePreset] = useState<string | null>(null);
-
+export interface AOISelection { name: string; bounds: [[number, number], [number, number]]; }
+export interface FetchedRealImages { before_b64: string; after_b64: string; before_date: string; after_date: string; before_cloud_pct: number; after_cloud_pct: number; before_id?: string; after_id?: string; }
+interface Props { selectedAOI: AOISelection | null; onAOISelected: (aoi: AOISelection | null) => void; onRealImagesFetched?: (images: FetchedRealImages | null) => void; disabled?: boolean; active?: boolean; }
+export default function AOIMapSelector({ selectedAOI, onAOISelected, onRealImagesFetched, disabled = false, active = true }: Props) {
+  const container = useRef<HTMLDivElement>(null); const map = useRef<LeafletMap | null>(null); const rectangle = useRef<LeafletRectangle | null>(null);
+  const callbacks = useRef({ onAOISelected, onRealImagesFetched }); useEffect(() => { callbacks.current = { onAOISelected, onRealImagesFetched }; }, [onAOISelected, onRealImagesFetched]);
+  const request = useRef<AbortController | null>(null); const drawing = useRef(false); const [drawMode, setDrawMode] = useState(false);
+  const [dateBefore, setDateBefore] = useState('2022-04-21'); const [dateAfter, setDateAfter] = useState('2022-07-15'); const [cloud, setCloud] = useState(35);
+  const [bounds, setBounds] = useState(['26.05', '91.55', '26.25', '91.85']); const [fetching, setFetching] = useState(false); const [error, setError] = useState(''); const [warnings, setWarnings] = useState<string[]>([]); const [loaded, setLoaded] = useState(false); const [tiles, setTiles] = useState(false);
+  const invalidate = () => { request.current?.abort(); request.current = null; setFetching(false); setLoaded(false); setWarnings([]); callbacks.current.onRealImagesFetched?.(null); };
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return;
-
-    // Dynamically import Leaflet to avoid build issues
-    import('leaflet').then(L => {
-      // Fix default icon paths
-      // @ts-expect-error – leaflet icon hack
-      delete L.Icon.Default.prototype._getIconUrl;
-      L.Icon.Default.mergeOptions({
-        iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-        iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-        shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-      });
-
-      const map = L.map(containerRef.current!, {
-        center: [22.5, 82.5],
-        zoom: 5,
-        zoomControl: true,
-        attributionControl: false,
-      });
-
-      // Dark satellite-style tile layer
-      L.tileLayer(
-        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        { maxZoom: 18 }
-      ).addTo(map);
-
-      // Light labels overlay
-      L.tileLayer(
-        'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-        { maxZoom: 18, opacity: 0.7 }
-      ).addTo(map);
-
-      // Drawing logic
-      let startLatLng: L.LatLng | null = null;
-      let drawingRect: L.Rectangle | null = null;
-      let drawMode = false;
-
-      map.on('mousedown', (e: L.LeafletMouseEvent) => {
-        if (!drawMode) return;
-        startLatLng = e.latlng;
-        map.dragging.disable();
-      });
-
-      map.on('mousemove', (e: L.LeafletMouseEvent) => {
-        if (!drawMode || !startLatLng) return;
-        const bounds = L.latLngBounds(startLatLng, e.latlng);
-        if (drawingRect) {
-          drawingRect.setBounds(bounds);
-        } else {
-          drawingRect = L.rectangle(bounds, {
-            color: '#1A6B6B',
-            weight: 2,
-            fillColor: '#1A6B6B',
-            fillOpacity: 0.15,
-            dashArray: '6,4',
-          }).addTo(map);
-        }
-      });
-
-      map.on('mouseup', (e: L.LeafletMouseEvent) => {
-        if (!drawMode || !startLatLng) return;
-        map.dragging.enable();
-        const bounds = L.latLngBounds(startLatLng, e.latlng);
-        if (drawingRect) {
-          drawingRect.setBounds(bounds);
-          rectRef.current = drawingRect;
-          drawingRect = null;
-        }
-        startLatLng = null;
-        drawMode = false;
-        setIsDrawing(false);
-
-        const sw = bounds.getSouthWest();
-        const ne = bounds.getNorthEast();
-        const center = bounds.getCenter();
-        onAOISelected({
-          name: `Custom AOI (${center.lat.toFixed(2)}°N, ${center.lng.toFixed(2)}°E)`,
-          bounds: [[sw.lat, sw.lng], [ne.lat, ne.lng]],
-        });
-        setActivePreset(null);
-      });
-
-      // Expose drawMode toggler
-      (map as unknown as { _startDraw: () => void })._startDraw = () => {
-        drawMode = true;
-        setIsDrawing(true);
-        // Remove existing rect
-        if (rectRef.current) {
-          rectRef.current.remove();
-          rectRef.current = null;
-        }
-        onAOISelected(null);
-        setActivePreset(null);
-      };
-
-      mapRef.current = map;
-      setMapReady(true);
-    });
-
-    return () => {
-      mapRef.current?.remove();
-      mapRef.current = null;
+    if (!container.current) return;
+    const instance = L.map(container.current, { center: [22.5, 82.5], zoom: 5, attributionControl: true }); map.current = instance;
+    const resize = new ResizeObserver(() => instance.invalidateSize()); resize.observe(container.current);
+    let start: L.LatLng | null = null;
+    const finish = (e: L.LeafletMouseEvent) => {
+if (!drawing.current || !start) return; const b = L.latLngBounds(start, e.latlng); start = null; drawing.current = false; setDrawMode(false); instance.dragging.enable(); if (b.getSouth() === b.getNorth() || b.getWest() === b.getEast()) return;
+      request.current?.abort(); request.current = null; setFetching(false); setLoaded(false); setWarnings([]); callbacks.current.onRealImagesFetched?.(null);
+      const next: AOISelection = { name: 'Custom requested AOI', bounds: [[b.getSouth(), b.getWest()], [b.getNorth(), b.getEast()]] }; setBounds(next.bounds.flat().map(v => v.toFixed(5))); callbacks.current.onAOISelected(next);
     };
+    instance.on('mousedown', (e: L.LeafletMouseEvent) => { if (drawing.current) { start = e.latlng; instance.dragging.disable(); } });
+    instance.on('mousemove', (e: L.LeafletMouseEvent) => { if (drawing.current && start) { const b = L.latLngBounds(start, e.latlng); if (rectangle.current) rectangle.current.setBounds(b); else rectangle.current = L.rectangle(b, { color: '#16877e', weight: 2 }).addTo(instance); } });
+    instance.on('mouseup', finish);
+    return () => { request.current?.abort(); request.current = null; resize.disconnect(); instance.remove(); map.current = null; rectangle.current = null; };
   }, []);
-
-  const handlePreset = (aoi: AOI) => {
-    if (!mapRef.current) return;
-    import('leaflet').then(L => {
-      // Remove old rect
-      if (rectRef.current) {
-        rectRef.current.remove();
-        rectRef.current = null;
-      }
-      const bounds = L.latLngBounds(aoi.bounds[0], aoi.bounds[1]);
-      const rect = L.rectangle(bounds, {
-        color: '#1A6B6B',
-        weight: 2,
-        fillColor: '#1A6B6B',
-        fillOpacity: 0.2,
-      }).addTo(mapRef.current!);
-      rectRef.current = rect;
-      mapRef.current!.fitBounds(bounds, { padding: [20, 20] });
-      onAOISelected({ name: aoi.name, bounds: aoi.bounds });
-      setActivePreset(aoi.name);
-    });
+  useEffect(() => { const instance = map.current; if (!instance || !tiles) return; const layer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 18, attribution: 'Tiles © Esri, Maxar, Earthstar Geographics' }).addTo(instance); layer.on('tileerror', () => setError('Reference tiles could not load. Coordinate entry remains available.')); return () => { layer.remove(); }; }, [tiles]);
+  useEffect(() => { const instance = map.current; if (!instance) return; rectangle.current?.remove(); rectangle.current = null; if (selectedAOI) { rectangle.current = L.rectangle(selectedAOI.bounds, { color: '#16877e', weight: 2, fillOpacity: .1 }).addTo(instance); instance.fitBounds(selectedAOI.bounds, { padding: [12, 12], animate: false }); } }, [selectedAOI]);
+  useEffect(() => { if (active) map.current?.invalidateSize(); }, [active]);
+  useEffect(() => { if (disabled) { drawing.current = false; map.current?.dragging.enable(); } }, [disabled]);
+  const choose = (aoi: AOISelection) => { invalidate(); setError(''); drawing.current = false; setDrawMode(false); map.current?.dragging.enable(); setBounds(aoi.bounds.flat().map(String)); onAOISelected(aoi); };
+  const apply = () => { const n = bounds.map(Number); if (bounds.some(v => !v.trim()) || n.some(v => !Number.isFinite(v)) || n[0] < -90 || n[2] > 90 || n[1] < -180 || n[3] > 180 || n[0] >= n[2] || n[1] >= n[3]) { setError('Use valid south < north and west < east coordinates within latitude/longitude limits.'); return; } choose({ name: 'Custom requested AOI', bounds: [[n[0], n[1]], [n[2], n[3]]] }); };
+  const fetchImages = async () => {
+if (!selectedAOI || disabled || fetching) return; if (!dateBefore || !dateAfter || dateBefore >= dateAfter) { setError('Choose an earlier first date and a later second date.'); return; } invalidate(); const abort = new AbortController(); request.current = abort; setFetching(true); setError(''); const [[south, west], [north, east]] = selectedAOI.bounds;
+    try {
+const response = await fetchRealImagery({ bbox: [west, south, east, north], dateBefore, dateAfter, maxCloudPct: cloud }, abort.signal); if (request.current !== abort || abort.signal.aborted) return;
+      callbacks.current.onRealImagesFetched?.({ before_b64: response.before.image_b64, after_b64: response.after.image_b64, before_date: response.before.date, after_date: response.after.date, before_cloud_pct: response.before.cloud_pct, after_cloud_pct: response.after.cloud_pct, before_id: response.before.scene_id, after_id: response.after.scene_id }); setLoaded(true); setWarnings(response.warnings ?? []);
+    } catch (e) { if (!abort.signal.aborted && request.current === abort) setError(e instanceof Error ? e.message : 'Imagery request failed.'); } finally { if (request.current === abort) { request.current = null; setFetching(false); } }
   };
-
-  const handleDraw = () => {
-    const map = mapRef.current as unknown as { _startDraw: () => void };
-    map?._startDraw?.();
-  };
-
-  const handleClear = () => {
-    if (rectRef.current) {
-      rectRef.current.remove();
-      rectRef.current = null;
-    }
-    onAOISelected(null);
-    setActivePreset(null);
-    mapRef.current?.setView([22.5, 82.5], 5);
-  };
-
-  return (
-    <div className="space-y-3">
-      {/* Preset AOI buttons */}
-      <div>
-        <p className="text-[10px] font-bold uppercase tracking-widest text-rs-text-muted mb-2">Preset Regions</p>
-        <div className="grid grid-cols-2 gap-1.5">
-          {PRESET_AOIS.map(aoi => (
-            <button
-              key={aoi.name}
-              onClick={() => handlePreset(aoi)}
-              className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-left transition-all text-xs ${
-                activePreset === aoi.name
-                  ? 'border-rs-teal bg-teal-50 text-rs-teal font-semibold'
-                  : 'border-rs-border bg-white text-rs-text-secondary hover:border-rs-teal hover:text-rs-teal'
-              }`}
-            >
-              <MapPin size={10} className="flex-shrink-0" />
-              <span className="truncate">{aoi.name.split(',')[0]}</span>
-              {activePreset === aoi.name && <CheckCircle2 size={10} className="flex-shrink-0 ml-auto" />}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Draw + Clear buttons */}
-      <div className="flex gap-2">
-        <button
-          onClick={handleDraw}
-          disabled={!mapReady}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg border text-xs font-semibold transition-all ${
-            isDrawing
-              ? 'bg-rs-teal text-white border-rs-teal'
-              : 'bg-white border-rs-border text-rs-text-secondary hover:border-rs-teal hover:text-rs-teal'
-          } disabled:opacity-50`}
-        >
-          <Square size={12} />
-          {isDrawing ? 'Click & drag on map…' : 'Draw AOI'}
-        </button>
-        {selectedAOI && (
-          <button
-            onClick={handleClear}
-            className="px-3 py-2 rounded-lg border border-rs-border text-xs text-rs-text-muted hover:border-red-300 hover:text-red-500 transition-all"
-          >
-            <RotateCcw size={12} />
-          </button>
-        )}
-      </div>
-
-      {/* Selected AOI display */}
-      {selectedAOI && (
-        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-teal-50 border border-teal-200">
-          <CheckCircle2 size={13} className="text-rs-teal flex-shrink-0" />
-          <div className="min-w-0">
-            <p className="text-xs font-semibold text-rs-teal truncate">{selectedAOI.name}</p>
-            <p className="text-[10px] text-teal-600 font-mono">
-              {selectedAOI.bounds[0][0].toFixed(2)}°N–{selectedAOI.bounds[1][0].toFixed(2)}°N
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Map container */}
-      <div className="relative rounded-xl overflow-hidden border border-rs-border" style={{ height: '220px' }}>
-        {!mapReady && (
-          <div className="absolute inset-0 bg-gray-100 flex items-center justify-center">
-            <p className="text-xs text-rs-text-muted">Loading map…</p>
-          </div>
-        )}
-        <div ref={containerRef} style={{ height: '100%', width: '100%' }} />
-        {isDrawing && (
-          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full bg-rs-navy text-white text-xs font-semibold shadow-lg">
-            Click and drag to draw AOI
-          </div>
-        )}
-      </div>
-
-      {/* Leaflet CSS loaded inline */}
-      <link
-        rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      />
-    </div>
-  );
+  return <div className="space-y-3"><p className="subtle">Requested search bounds, not verified image coverage. Catalogue previews may cover a larger area.</p>
+    <fieldset disabled={disabled} className="space-y-3" onKeyDown={e => { if (e.key === 'Escape') { drawing.current = false; setDrawMode(false); map.current?.dragging.enable(); } }}><legend className="field-label">Area of interest</legend><div className="grid grid-cols-2 gap-2">{PRESET_AOIS.map(p => <button key={p.name} type="button" className="btn-ghost text-xs" onClick={() => choose(p)}><MapPin size={12} />{p.name.split(',')[0]}</button>)}</div>
+      <div ref={container} style={{ height: 220 }} aria-label="Reference map, coordinate alternative below" />
+      <button type="button" className="btn-ghost text-xs w-full" onClick={() => setTiles(v => !v)}>{tiles ? 'Hide reference tiles' : 'Load Esri reference tiles (external)'}</button>
+      <div className="flex gap-2"><button type="button" className="btn-ghost text-xs" aria-pressed={drawMode} onClick={() => { drawing.current = !drawing.current; setDrawMode(drawing.current); map.current?.dragging.enable(); }}> {drawMode ? 'Cancel drawing' : 'Draw rectangle'}</button><button type="button" className="btn-ghost text-xs" onClick={() => { invalidate(); drawing.current = false; setDrawMode(false); map.current?.dragging.enable(); onAOISelected(null); }}>Clear AOI</button></div>
+      {drawMode && <p role="status" className="subtle">Drag on the map, or use coordinate fields below. Escape cancels drawing.</p>}
+      <div className="grid grid-cols-2 gap-2" onKeyDown={e => { if (e.key === 'Escape') { drawing.current = false; setDrawMode(false); map.current?.dragging.enable(); } }}>{['South latitude', 'West longitude', 'North latitude', 'East longitude'].map((label, i) => <label key={label} className="field-label">{label}<input className="input-field mt-1" type="number" step="any" value={bounds[i]} onChange={e => { invalidate(); setBounds(prev => prev.map((v, n) => n === i ? e.target.value : v)); onAOISelected(null); }} /></label>)}</div>
+      <button type="button" className="btn-ghost w-full text-xs" onClick={apply}>Apply coordinates</button>
+      <div className="grid grid-cols-2 gap-2"><label className="field-label">First requested date<input className="input-field mt-1" type="date" value={dateBefore} onChange={e => { invalidate(); setDateBefore(e.target.value); }} /></label><label className="field-label">Second requested date<input className="input-field mt-1" type="date" value={dateAfter} onChange={e => { invalidate(); setDateAfter(e.target.value); }} /></label></div>
+      <label className="field-label">Maximum catalogue cloud cover (%)<input className="input-field mt-1" type="number" min="0" max="100" value={cloud} onChange={e => { invalidate(); setCloud(Math.min(100, Math.max(0, Number(e.target.value)))); }} /></label>
+      <button className="btn-primary w-full text-xs" type="button" disabled={!selectedAOI || fetching} onClick={fetchImages}>{fetching ? 'Retrieving catalogue imagery…' : 'Retrieve imagery pair'}</button></fieldset>
+    {fetching && <button className="btn-ghost text-xs" onClick={invalidate}>Cancel retrieval</button>}{loaded && <p role="status" className="subtle">Imagery attached. Returned acquisition dates appear in the setup summary.</p>}{error && <p role="alert" className="notice">{error}</p>}{warnings.map(w => <p className="notice" key={w}>{w}</p>)}
+  </div>;
 }

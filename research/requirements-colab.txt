@@ -1,0 +1,20 @@
+# Python 3.11/3.12 Colab; restart runtime after installation, before imports.
+torch==2.7.1
+torchvision==0.22.1
+transformers==4.51.3
+accelerate==1.6.0
+huggingface-hub==0.30.2
+datasets==3.6.0
+numpy==2.2.6
+pillow==11.2.1
+opencv-python-headless==4.11.0.86
+scikit-image==0.25.2
+scipy==1.15.3
+pandas==2.2.3
+matplotlib==3.10.3
+kornia==0.8.1
+imageio==2.37.0
+PyYAML==6.0.2
+pydantic==2.11.5
+pytest==8.3.5
+satellite-cloud-generator @ git+https://github.com/strath-ai/SatelliteCloudGenerator.git@d0787cbdc1b39a7976f89aa085f1430f3207eda6

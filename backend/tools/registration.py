@@ -42,8 +42,8 @@ from backend.schemas.provenance import RegistrationQuality
 
 ECC_MAX_ITER = 200
 ECC_EPSILON  = 1e-5
-STRICT_ERROR_THRESHOLD = 5.0   # pixels; above this → PARTIAL quality
-FAILED_THRESHOLD       = 15.0  # pixels; above this → FAILED quality
+STRICT_ERROR_THRESHOLD = 5.0   # intensity levels (0–255); above this → PARTIAL quality
+FAILED_THRESHOLD       = 15.0  # intensity levels (0–255); above this → FAILED quality
 
 
 # ── Result data class ─────────────────────────────────────────────────────────
@@ -54,14 +54,14 @@ class RegistrationResult:
     Outcome of image registration.
 
     The `registered_image` field should only be used for change detection
-    when quality == SUCCESS or PARTIAL.
+    when quality == SUCCESS.
     When quality == FAILED, callers MUST NOT use registered_image for
     quantitative change analysis.
     """
     registered_image: Optional[np.ndarray]  # None when quality==FAILED
     quality: RegistrationQuality
     method: str       # e.g. "ECC_TRANSLATION" | "ECC_AFFINE" | "FAILED"
-    mean_alignment_error_px: Optional[float]  # None when not measurable
+    mean_absolute_intensity_residual: Optional[float]  # None when not measurable
     warp_matrix: Optional[np.ndarray]         # None when failed
     t2_was_resized: bool
     original_t2_shape: Tuple[int, int]        # (H, W) before resize
@@ -74,7 +74,7 @@ class RegistrationResult:
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def _to_grey(img: np.ndarray) -> np.ndarray:
-    """Convert uint8 array to single-channel float32 [0,1] for ECC."""
+    """Convert uint8 array to single-channel float32 [0,255] for ECC."""
     if img.ndim == 3 and img.shape[2] >= 3:
         grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     elif img.ndim == 2:
@@ -84,11 +84,12 @@ def _to_grey(img: np.ndarray) -> np.ndarray:
     return grey.astype(np.float32)
 
 
-def _mean_reprojection_error(img1_grey: np.ndarray, img2_warped: np.ndarray) -> float:
+def _mean_absolute_intensity_residual(img1_grey: np.ndarray, img2_warped: np.ndarray) -> float:
     """
     Estimate mean absolute per-pixel difference after alignment.
     Used as a proxy for registration quality.
-    Lower = better alignment.
+    Units are intensity levels (0–255), not spatial pixels.
+    Lower residual does not prove geometric alignment.
     """
     diff = np.abs(img1_grey.astype(np.float32) - img2_warped.astype(np.float32))
     return float(np.mean(diff))
@@ -144,7 +145,7 @@ def register_images(
     t_start = time.monotonic()
     original_t2_shape = t2.shape[:2]
     target_shape = t1.shape[:2]
-    warnings = []
+    warnings = ["Photometric residual is a conservative screening heuristic, not geometric accuracy in pixels; illumination and genuine change affect it."]
     t2_was_resized = False
 
     # ── Resize T2 to match T1 if dimensions differ ────────────────────────────
@@ -173,7 +174,7 @@ def register_images(
             g2, warp_t, (W, H),
             flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
         )
-        error_t = _mean_reprojection_error(g1, t2_warped_grey)
+        error_t = _mean_absolute_intensity_residual(g1, t2_warped_grey)
         method_t = "ECC_TRANSLATION"
         success_t = True
     except cv2.error:
@@ -194,7 +195,7 @@ def register_images(
                 g2, warp_a, (W, H),
                 flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
             )
-            error_a = _mean_reprojection_error(g1, t2_warped_grey_a)
+            error_a = _mean_absolute_intensity_residual(g1, t2_warped_grey_a)
             method_a = "ECC_AFFINE"
             success_a = True
         except cv2.error:
@@ -218,7 +219,7 @@ def register_images(
             registered_image=None,
             quality=RegistrationQuality.FAILED,
             method="FAILED",
-            mean_alignment_error_px=None,
+            mean_absolute_intensity_residual=None,
             warp_matrix=None,
             t2_was_resized=t2_was_resized,
             original_t2_shape=original_t2_shape,
@@ -239,15 +240,15 @@ def register_images(
     if best_error > FAILED_THRESHOLD:
         quality = RegistrationQuality.FAILED
         warnings.append(
-            f"Registration error {best_error:.1f}px exceeds FAILED threshold "
-            f"({FAILED_THRESHOLD}px). Using this result for change detection is invalid."
+            f"Registration error {best_error:.1f} intensity levels exceeds FAILED threshold "
+            f"({FAILED_THRESHOLD} intensity levels). Using this result for change detection is invalid."
         )
         registered_image = None
     elif best_error > STRICT_ERROR_THRESHOLD:
         quality = RegistrationQuality.PARTIAL
         warnings.append(
-            f"Registration error {best_error:.1f}px exceeds strict threshold "
-            f"({STRICT_ERROR_THRESHOLD}px). Change detection results flagged as PARTIAL quality."
+            f"Registration error {best_error:.1f} intensity levels exceeds strict threshold "
+            f"({STRICT_ERROR_THRESHOLD} intensity levels). Change detection results flagged as PARTIAL quality."
         )
         registered_image = _apply_warp(t2, best_warp, target_shape, motion_type)
     else:
@@ -260,7 +261,7 @@ def register_images(
         registered_image=registered_image,
         quality=quality,
         method=best_method,
-        mean_alignment_error_px=round(best_error, 3),
+        mean_absolute_intensity_residual=round(best_error, 3),
         warp_matrix=best_warp,
         t2_was_resized=t2_was_resized,
         original_t2_shape=original_t2_shape,
@@ -268,7 +269,7 @@ def register_images(
         processing_time_ms=elapsed_ms,
         message=(
             f"Registration {quality.value.lower()} via {best_method}. "
-            f"Mean alignment error: {best_error:.1f}px."
+            f"Mean absolute intensity residual: {best_error:.1f} intensity levels."
         ),
         warnings=warnings,
     )

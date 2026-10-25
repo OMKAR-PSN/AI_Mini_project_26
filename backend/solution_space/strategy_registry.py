@@ -33,6 +33,7 @@ STRATEGY_REGISTRY: Dict[str, List[str]] = {
         "image_validation",
         "scene_understanding",
         "sar_optical_fusion",
+        "object_region_detection",
         "evidence_comparison",
         "confidence_check",
         "answer_synthesis",
@@ -41,7 +42,6 @@ STRATEGY_REGISTRY: Dict[str, List[str]] = {
     TaskType.CLOUD_ANALYSIS: [
         "image_validation",
         "cloud_detection",
-        "cloud_reconstruction",
         "scene_understanding",
         "confidence_check",
         "answer_synthesis",

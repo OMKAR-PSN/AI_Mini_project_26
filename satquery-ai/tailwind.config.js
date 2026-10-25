@@ -38,12 +38,12 @@ export default {
           orange: '#E07B39',
           amber: '#D97706',
           green: '#2E7D52',
-          bg: '#F5F7FA',
-          panel: '#FFFFFF',
-          border: '#E2E8F0',
-          'text-primary': '#0F172A',
-          'text-secondary': '#475569',
-          'text-muted': '#94A3B8',
+          bg: 'var(--bg)',
+          panel: 'var(--panel)',
+          border: 'var(--border)',
+          'text-primary': 'var(--text-primary)',
+          'text-secondary': 'var(--text-secondary)',
+          'text-muted': 'var(--text-muted)',
         }
       },
       fontFamily: {
