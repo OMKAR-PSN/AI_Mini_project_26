@@ -76,9 +76,19 @@ export default function AnalysisPage({ initialScenario = null }: { initialScenar
   const exportReport = async () => { if (!result) return; setExporting(true); try { await generateAnalysisReport({ query: runQuery, analysisId: result.analysisId, aoiName: runAOI, images: inputMetadata, traceItems, finalAnswer: result.finalAnswer, confidence: result.confidence, confidenceLevel: result.confidenceLevel, evidenceStatus: result.evidenceStatus, evidencePoints: result.evidencePoints, visualOutputs: result.visualOutputs, outcome: result.outcome, limitations: result.limitations, verified: result.verified, scoreKind: result.scoreKind, auditHash: result.auditHash, thresholdPolicy: result.thresholdPolicy }); } catch (e) { setError(e instanceof Error ? e.message : 'Export failed.'); } finally { setExporting(false); } };
   const outputs: VisualOutput[] = result?.visualOutputs ?? thumbnails.map((b64, i) => ({ type: i === 0 ? 'before' : 'after', label: `${isDemo ? 'Demonstration input' : 'Original observation'} ${i + 1}`, b64 }));
   return <div>
-    <div className="workspace-toolbar"><Satellite size={18} style={{ color: 'var(--accent)' }} /><h1>Analysis workspace</h1><span className="subtle" role="status">{running ? 'Processing imagery' : result?.outcome?.replaceAll('_', ' ') ?? 'Configure an analysis'}</span>
-      <div className="ml-auto flex gap-2"><button className="btn-ghost text-xs" onClick={reset}><RotateCcw size={13} />{running ? 'Stop viewing run' : 'New analysis'}</button>{result && <button className="btn-primary text-xs" disabled={exporting} onClick={exportReport}><FileDown size={13} />{exporting ? 'Exporting…' : 'Export PDF'}</button>}</div></div>
-    {error && <p role="alert" className="notice m-3">{error}</p>}
+    <div className="workspace-toolbar">
+      <Satellite size={18} style={{ color: 'var(--accent)' }} />
+      <h1>Analysis workspace</h1>
+      <span className="flex items-center gap-2" role="status" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+        {running && <span className="running-dot" />}
+        {running ? 'Processing imagery…' : result?.outcome?.replaceAll('_', ' ') ?? 'Configure an analysis'}
+      </span>
+      <div className="ml-auto flex gap-2">
+        <button className="btn-ghost text-xs" onClick={reset}><RotateCcw size={13} />{running ? 'Stop viewing run' : 'New analysis'}</button>
+        {result && <button className="btn-primary text-xs" disabled={exporting} onClick={exportReport}><FileDown size={13} />{exporting ? 'Exporting…' : 'Export PDF'}</button>}
+      </div>
+    </div>
+    {error && <p role="alert" className="notice m-3 animate-fade-in">{error}</p>}
     <nav className="workspace-mobile-nav segmented" aria-label="Workspace sections">{['setup', 'imagery', 'results'].map(section => <button key={section} aria-pressed={mobileSection === section} onClick={() => setMobileSection(section)}>{section[0].toUpperCase() + section.slice(1)}</button>)}</nav>
     <div className="workspace-grid">
       <aside className="workspace-column" data-active={mobileSection === 'setup'} aria-label="Analysis setup">

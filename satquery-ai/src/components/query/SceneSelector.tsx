@@ -11,7 +11,6 @@ interface SceneSelectorProps {
 }
 
 const DEMO_ICONS = [Activity, Layers, Cloud];
-const DEMO_ACCENT = ['bg-navy-100 text-rs-navy', 'bg-teal-50 text-rs-teal', 'bg-orange-50 text-rs-orange'];
 
 export default function SceneSelector({ scenarios, selectedId, onSelect, disabled }: SceneSelectorProps) {
   return (
@@ -25,24 +24,29 @@ export default function SceneSelector({ scenarios, selectedId, onSelect, disable
             aria-pressed={selected}
             key={s.scenario_id}
             onClick={() => onSelect(s.scenario_id)}
-            className={`w-full text-left p-3 rounded border transition-all group ${selected
-                ? 'border-rs-navy bg-navy-50'
-                : 'border-rs-border bg-white hover:border-navy-200 hover:shadow-sm'
-              }`}
+            className="scene-card"
+            style={selected ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)', borderLeftWidth: 4 } : {}}
           >
             <div className="flex items-start gap-3">
-              <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${DEMO_ACCENT[idx]}`}>
+              <div
+                className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0"
+                style={{
+                  background: selected ? `color-mix(in srgb, var(--accent) 18%, transparent)` : 'var(--surface-subtle)',
+                  color: selected ? 'var(--accent)' : 'var(--text-muted)',
+                  transition: 'all .2s',
+                }}
+              >
                 <Icon size={18} />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 mb-0.5">
-                  <span className="font-semibold text-sm text-rs-text-primary truncate">{s.title}</span>
-                  {selected && <CheckCircle2 size={14} className="text-rs-navy flex-shrink-0" />}
+                  <span className="font-semibold text-sm truncate" style={{ color: 'var(--text-primary)' }}>{s.title}</span>
+                  {selected && <CheckCircle2 size={14} style={{ color: 'var(--accent)', flexShrink: 0 }} />}
                 </div>
-                <p className="text-xs text-rs-text-secondary leading-snug">{s.task_type === 'sar_optical' ? 'Unavailable capability demonstration. No SAR fusion is executed.' : s.task_type === 'bi_temporal_change' ? 'Grayscale intensity diagnostics. Semantic change is unsupported.' : 'RGB cloud candidates and optional CPU inpainting.'}</p>
+                <p className="subtle" style={{ fontSize: 11, lineHeight: 1.5 }}>{s.task_type === 'sar_optical' ? 'Unavailable capability demonstration. No SAR fusion is executed.' : s.task_type === 'bi_temporal_change' ? 'Grayscale intensity diagnostics. Semantic change is unsupported.' : 'RGB cloud candidates and optional CPU inpainting.'}</p>
                 <div className="flex flex-wrap gap-1 mt-2">
                   {s.images.map((img, i) => (
-                    <span key={i} className="badge badge-gray text-[10px]">
+                    <span key={i} className="badge badge-gray" style={{ fontSize: 9 }}>
                       {img.sensor} · {img.image_type}
                     </span>
                   ))}

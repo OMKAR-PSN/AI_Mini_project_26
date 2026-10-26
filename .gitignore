@@ -14,3 +14,19 @@ research/provenance/generator_tree.json
 research/real_cloud_annotations/images/*
 research/real_cloud_annotations/masks/*
 !research/real_cloud_annotations/**/.gitkeep
+
+# Local environments, credentials and generated artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+/tmp/
+/output/
+research/analysis/phase3b/*
+!research/analysis/phase3b/README.md
+!research/analysis/phase3b/E1_E2_PRELIMINARY_RESULTS.md

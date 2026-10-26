@@ -1,0 +1,23 @@
+# Railway deployment ignore (keeps image small)
+.git
+.gitignore
+node_modules
+satquery-ai/node_modules
+satquery-ai/dist
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+tests/
+.env.local
+*.log
+data/raw/
+
+.env
+.env.*
+!.env.example
+research/
+tmp/
+output/
+*.docx
+*.pdf

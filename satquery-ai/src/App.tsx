@@ -28,16 +28,22 @@ export default function App() {
 
       <main id="main-content" className="flex-1" tabIndex={-1}>
         {page === 'home' && (
-          <HomePage onNavigate={handleNavigate} onStartDemo={handleStartDemo} />
+          <div key="home" className="animate-fade-in">
+            <HomePage onNavigate={handleNavigate} onStartDemo={handleStartDemo} />
+          </div>
         )}
         {page === 'analysis' && (
-          <AnalysisPage
-            initialScenario={demoScenario}
-            key={demoScenario ?? 'analysis'}
-          />
+          <div key="analysis" className="animate-fade-in">
+            <AnalysisPage
+              initialScenario={demoScenario}
+              key={demoScenario ?? 'analysis'}
+            />
+          </div>
         )}
         {page === 'system' && (
-          <SystemViewPage />
+          <div key="system" className="animate-fade-in">
+            <SystemViewPage />
+          </div>
         )}
       </main>
     </div>
